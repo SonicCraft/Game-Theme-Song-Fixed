@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { SteamDialog } from './SteamDialog';
-import { closeManagerPopup, subscribeManagerPopups, type ManagerPopup } from '../settings/managerPopups';
+import { closeManagerPopup, subscribeManagerPopups, setMainManagerElement, type ManagerPopup } from '../settings/managerPopups';
 import { MainPopupContent } from './MainPopup';
 
 export const ManagerWindows: React.FC = () => {
@@ -20,6 +20,7 @@ export const ManagerWindows: React.FC = () => {
           resizable
           saveDimensionsKey="gtsMainPopup"
         >
+          <span data-gts-main-manager-v17="true" ref={setMainManagerElement} style={{ display: 'none' }} />
           <MainPopupContent />
         </SteamDialog>
       )}

@@ -2,13 +2,13 @@ import React from 'react';
 import { definePlugin, routerHook, ButtonItem } from 'millennium';
 import { loadSettingsOnce, startPolling, registerLaunchStop, unregisterLaunchStop, loadIgnoredOnce, startFocusWatch, stopFocusWatch } from './core/engine';
 import { ManagerWindows } from './core/ManagerWindows';
+import { startGamePageMusicNote, stopGamePageMusicNote } from './core/GamePageMusicNote';
 import { setupNowPlaying, removeNowPlaying } from './core/NowPlaying';
 import { openManagerPopup } from './settings/managerPopups';
 import { t } from './core/i18n';
 
 export { hookedMusicButton } from './core/MusicButtonHook';
 
-const isLinux = /linux/i.test(navigator.userAgent);
 
 const SettingsContent: React.FC = () => (
 	<ButtonItem
@@ -25,6 +25,7 @@ export default definePlugin(() => {
 	void loadSettingsOnce();
 	void loadIgnoredOnce();
 	routerHook.addGlobalComponent('GTSManagerWindows', ManagerWindows);
+	startGamePageMusicNote();
 	startPolling();
 	registerLaunchStop();
 	startFocusWatch();
@@ -32,8 +33,9 @@ export default definePlugin(() => {
 	return {
 		title: 'Game Theme Song',
 		icon: <></>,
-		content: isLinux ? <SettingsContent /> : undefined,
+		content: <SettingsContent />,
 		onDismount() {
+			stopGamePageMusicNote();
 			routerHook.removeGlobalComponent('GTSManagerWindows');
 			unregisterLaunchStop();
 			stopFocusWatch();

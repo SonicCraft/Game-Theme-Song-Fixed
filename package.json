@@ -1,6 +1,6 @@
 {
   "name": "game-theme-song",
-  "version": "2.2.0",
+  "version": "3.0.0",
   "description": "Plays a game's theme music in the background on its Steam library page.",
   "author": "BambooFury",
   "license": "MIT",
@@ -9,7 +9,9 @@
     "build:assets": "node scripts/build-assets.mjs",
     "dev": "node scripts/build-assets.mjs && starlight watch",
     "build": "node scripts/build-assets.mjs && starlight pack --release -o dist",
-    "prepare": "starlight lsp"
+    "prepare": "starlight lsp",
+    "version:set": "node scripts/version-sync.mjs",
+    "version:check": "node scripts/version-sync.mjs --check"
   },
   "devDependencies": {
     "@steambrew/starlight": "^1.1.3",

@@ -1,83 +1,50 @@
-<h1 align="center">Game Theme Song</h1>
+# Game Theme Song (Fixed)
 
-<p align="center">
-  Every game in your library has a soundtrack.<br>
-  Open a game page - its theme music starts playing. No clicks, no setup.
-</p>
+A community-maintained fork of [BambooFury/Game-Theme-Song](https://github.com/BambooFury/Game-Theme-Song), modified for Steam Millennium.
 
-<p align="center">
-  <a href="https://github.com/BambooFury/Game-Theme-Song/releases"><img src="https://img.shields.io/github/v/release/BambooFury/Game-Theme-Song?style=flat-square&label=Version&color=1a9fff"></a>
-  <a href="https://github.com/BambooFury/Game-Theme-Song/releases"><img src="https://img.shields.io/github/downloads/BambooFury/Game-Theme-Song/total?style=flat-square&label=Downloads&color=2ecc71"></a>
-  <a href="https://github.com/BambooFury/Game-Theme-Song/stargazers"><img src="https://img.shields.io/github/stars/BambooFury/Game-Theme-Song?style=flat-square&label=Stars&color=FFD43B"></a>
-  <img src="https://img.shields.io/github/license/BambooFury/Game-Theme-Song?style=flat-square&label=License&color=4CAF50">
-</p>
-
-<p align="center">
-  <img src=".github/preview.png" alt="Game Theme Song" width="850">
-</p>
-
----
+**Current version: v3.0.0**. Based on original upstream v2.2.0.
 
 ## Features
 
-- **Automatic theme music** - open a game page and its theme starts playing in the background
-- **Smart search** - official soundtracks are looked up from multiple sources and scored, so only confident matches play
-- **Music note button** - a small note on every game page opens the full control popup
-- **Custom tracks** - assign your own audio file to any game, it always overrides the auto search
-- **Default song** - a fallback track of your choice for games with no found music
-- **Nothing is ever lost** - custom tracks live in a separate folder and are restored automatically after reinstalling
-- **Localized** - the interface follows your Steam language: English, Russian, French, German, Italian, Polish, Spanish, Chinese, Japanese, Ukrainian
-- **Download manager** - every downloaded track is cached, listed and removable
+- Automatically discovers game themes using YouTube; prioritizes soundtrack matches, including main themes and main-menu tracks.
+- Lets you search YouTube manually, listen to 15-second local previews, then confirm the full download.
+- Isolates preview, search, and full-download intermediates; cleans them after failed operations or interrupted Steam sessions.
+- Assigns confirmed results as custom themes, alongside local files and pasted YouTube links.
+- Manages downloaded and custom themes together, including per-game deletion and a confirmed bulk-clear operation.
+- Supports global and per-game playback volume, looping, length limits, fades, and a default fallback theme.
+- Shows the music-note manager button in desktop Steam only. Big Picture background playback remains available without an injected button.
+- Protects automatically downloaded audio and its cache index using persistent copies outside Steam's UI directory.
 
-## Installation
+## Requirements
 
-1. Install [Millennium](https://steambrew.app)
-2. Open **Millennium** in the Steam menu
-3. Choose **Install the plugin** and paste the plugin ID
-4. Restart Steam
+- Steam on Windows with [Millennium](https://steambrew.app/).
+- [yt-dlp](https://github.com/yt-dlp/yt-dlp) for YouTube search and downloads.
+- [FFmpeg](https://ffmpeg.org/) for 15-second audio previews and conversion.
+- Node.js and npm **only to build from source**.
 
-## How it works
+Ensure yt-dlp and ffmpeg are accessible to the plugin. Restart Steam after installing or updating them.
 
-1. You open a game page - the plugin detects the game
-2. It looks up the official soundtrack (Khinsider, Internet Archive, SoundCloud) and scores every candidate
-3. Only a confident match is downloaded - once, then cached
-4. The track fades in, cross-fades between games and fades out when you leave
+## Build from source
 
-## The music note button
+```powershell
+npm install
+npm run version:check
+npm run build
+```
 
-Every game page gets a small music note button. It opens a native popup with four tabs:
+The resulting `.star` should be in `dist/`. Install it as a Millennium plugin and fully restart Steam. Keep a backup of your existing `.star` and local music before upgrading.
 
-- **Now Playing** - what's playing, with playback controls: keep a new song, find another one, or stop
-- **Settings** - volume, fade duration, song length limit, loop, manual search, confirm-before-keep, stop on game launch, interface language
-- **Downloaded** - everything cached so far, with size and one-click removal
-- **Custom Music** - assign your own track to any game
+## Versioning
 
-## Custom music
+The release version uses `MAJOR.MINOR.PATCH`; current version is `3.0.0`. This is the first public fork release, derived from the internally tested v21.4.2 baseline with pre-release cleanup hardening. To bump all metadata files, run:
 
-Open the popup's **Custom Music** tab, search for a game and pick any audio file (MP3, M4A, AAC, OGG, OPUS, WAV, FLAC - up to 50 MB). Your track always plays instead of the auto search.
+```powershell
+npm run version:set -- 3.0.1
+npm run version:check
+```
 
-Everything is stored in `<Steam>/millennium/game-theme-song-custom/` together with the game mapping. This folder survives plugin removal - reinstall and every track is restored automatically.
+Use a matching GitHub release tag (starting with `v3.0.0`). The original upstream v2.2.0 and internal development v21.4.2 are historical references, not public release versions.
 
-If a game has no music at all, set a **default song** in Settings - it plays for every game where the search comes up empty.
+## Credits and license
 
-## FAQ
-
-**Does it slow down Steam?**
-
-No. Tracks are cached after the first play and playback is a single background audio element.
-
-**Does it play over my games?**
-
-No. Music only plays while you browse a game page and fades out when you leave.
-
-**A game got the wrong music?**
-
-Press *Find another* for a different match, or set your own track - your pick always wins.
-
-## License
-
-MIT - see [LICENSE](LICENSE). Not affiliated with Valve or Steam.
-
-<p align="center">
-  Made for <a href="https://steambrew.app">Millennium</a>
-</p>
+Original plugin by **BambooFury**. Fork improvements and maintenance by **SonicCraft**. Licensed under the existing MIT license; see [LICENSE](LICENSE). Not affiliated with Valve, Steam, Millennium, YouTube or yt-dlp.

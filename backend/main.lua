@@ -82,6 +82,11 @@ local RESOLVE_MARKER = join(DATA_DIR, "resolve.lock")
 local BOOT_MARKER = join(DATA_DIR, "boot.lock")
 local AUDIO_DIR = join(norm_path(millennium.steam_path()), "steamui", "game_theme_song")
 local CUSTOM_BACKUP_DIR = norm_path(join(norm_path(millennium.steam_path()), "millennium", "game-theme-song-custom"))
+-- v21.4.2: persistent automatic downloads, deliberately outside steamui.
+local AUTO_BACKUP_DIR = norm_path(join(norm_path(millennium.steam_path()), "millennium", "game-theme-song-auto-cache"))
+local AUTO_TRACK_DIR = join(AUTO_BACKUP_DIR, "tracks")
+local AUTO_INDEX_FILE = join(AUTO_BACKUP_DIR, "cache.json")
+local AUTO_PREVIOUS_INDEX_FILE = join(AUTO_BACKUP_DIR, "cache.previous.json")
 local CUSTOM_BACKUP_FILE = join(CUSTOM_BACKUP_DIR, "custom.json")
 local LOOPBACK_BASE = "https://steamloopback.host/game_theme_song/"
 local CONFIG_VERSION = 14
@@ -90,13 +95,14 @@ local DEFAULT_SETTINGS = {
     config_version = CONFIG_VERSION,
     enabled = true,
     volume = 0.35,
+    volume_overrides = {},
     fade_seconds = 1.5,
     search_suffix = " theme song",
     loop = true,
     max_seconds = 0,
     stop_on_launch = true,
-    manual_search = true,
-    confirm_before_download = true,
+    manual_search = false,
+    confirm_before_download = false,
     fallback_file = "",
     fallback_title = "",
     fallback_ts = 0,
@@ -401,6 +407,9 @@ if not ok_i or type(ignored) ~= "table" then ignored = {}; pcall(os.remove, IGNO
 end
 if (loaded.config_version or 0) < CONFIG_VERSION then loaded.config_version = CONFIG_VERSION end
         settings = merge_defaults(loaded, DEFAULT_SETTINGS)
+        -- v21: retire legacy modes unconditionally, including old user settings.
+        settings.manual_search = false
+        settings.confirm_before_download = false
     end)
     if not ok_s or type(settings) ~= "table" then
         settings = merge_defaults({}, DEFAULT_SETTINGS)
@@ -409,7 +418,25 @@ if (loaded.config_version or 0) < CONFIG_VERSION then loaded.config_version = CO
 end
 
 local function save_cache()
-    local s = safe_encode(cache); if s then write_file_atomic(CACHE_FILE, s) end
+    local s = safe_encode(cache)
+    if not s then return false end
+    pcall(fs.create_directories, AUTO_BACKUP_DIR)
+    -- Preserve the preceding valid index before replacing either copy.
+    local old = read_file(CACHE_FILE)
+    if old and type(safe_decode(old)) == 'table' and old ~= s then
+        write_file_atomic(AUTO_PREVIOUS_INDEX_FILE, old)
+    end
+    -- Save the durable copy FIRST. If that fails, leave the old live index
+    -- untouched instead of accepting a new entry without any backup.
+    if not write_file_atomic(AUTO_INDEX_FILE, s) then
+        logger:warn('Could not back up downloaded theme index; keeping old live index')
+        return false
+    end
+    if not write_file_atomic(CACHE_FILE, s) then
+        logger:warn('Could not update live downloaded theme index; recovery copy retained')
+        return false
+    end
+    return true
 end
 
 local function save_settings()
@@ -668,6 +695,154 @@ if sig4 == "\26\69\223\163" then return true end
     return false, head:gsub("%c", "."):sub(1, 16)
 end
 
+-- v21.4.2: only cache tracks, never custom/default songs, are mirrored.
+-- Steam loopback URLs still point to AUDIO_DIR, so restore files there when
+-- Steam recreates its steamui directory. The backup is never served directly.
+local function gts_auto_cache_name(key, name)
+    if type(key) ~= 'string' or not key:match('^%d+$') or #key > 12 then return false end
+    if type(name) ~= 'string' or name:find('/', 1, true) or name:find(string.char(92), 1, true) or name:find('..', 1, true) then return false end
+    for _, ext in ipairs(AUDIO_EXTS) do
+        if name == key .. '.' .. ext or name == key .. '_b.' .. ext then return true end
+    end
+    return false
+end
+local function gts_auto_file_length(path)
+    local f = io.open(path, 'rb')
+    if not f then return 0 end
+    local len = f:seek('end') or 0
+    f:close()
+    return len
+end
+-- Avoid creating unnecessary .previous copies for an unchanged track.
+-- Compare in bounded chunks, not full-song Lua strings. A read failure is
+-- treated as NOT equal; never prune based on a failed comparison.
+local function gts_auto_same_audio(left, right)
+    local a, b = io.open(left, 'rb'), io.open(right, 'rb')
+    if not a or not b then
+        if a then a:close() end
+        if b then b:close() end
+        return false
+    end
+    local ok, equal = pcall(function()
+        local al, bl = a:seek('end'), b:seek('end')
+        if not al or al < 1024 or al ~= bl then return false end
+        a:seek('set', 0); b:seek('set', 0)
+        while true do
+            local ac, bc = a:read(262144), b:read(262144)
+            if ac ~= bc then return false end
+            if not ac then return true end
+        end
+    end)
+    pcall(function() a:close() end)
+    pcall(function() b:close() end)
+    return ok and equal == true
+end
+local function gts_auto_copy_audio(src, dst)
+    if not looks_like_audio(src) then return false end
+    if looks_like_audio(dst) and gts_auto_same_audio(src, dst) then return true end
+    local fin = io.open(src, 'rb')
+    if not fin then return false end
+    local tmp = dst .. '.incoming'
+    local fout = io.open(tmp, 'wb')
+    if not fout then fin:close(); return false end
+    local success, copied = true, 0
+    while true do
+        local bytes = fin:read(262144)
+        if not bytes then break end
+        copied = copied + #bytes
+        if not fout:write(bytes) then success = false; break end
+    end
+    fin:close(); fout:close()
+    if not success or copied < 1024 or not looks_like_audio(tmp) then
+        pcall(os.remove, tmp)
+        return false
+    end
+    -- Never leave the only good backup vulnerable to a truncated write.
+    local previous = dst .. '.previous'
+    if fs.exists(dst) then
+        if looks_like_audio(dst) and src ~= previous then
+            -- A valid current mirror may safely become the recovery generation.
+            pcall(os.remove, previous)
+            if not os.rename(dst, previous) then
+                pcall(os.remove, tmp)
+                return false
+            end
+        else
+            -- A damaged mirror must NEVER replace a known-good .previous.
+            -- Also preserve .previous when it is itself the recovery source.
+            if not os.remove(dst) and fs.exists(dst) then
+                pcall(os.remove, tmp)
+                return false
+            end
+        end
+    end
+    if not os.rename(tmp, dst) then
+        if src ~= previous and not fs.exists(dst) and fs.exists(previous) then pcall(os.rename, previous, dst) end
+        pcall(os.remove, tmp)
+        return false
+    end
+    return true
+end
+local function gts_auto_forget_audio(key, name)
+    if not gts_auto_cache_name(key, name) then return end
+    local target = join(AUTO_TRACK_DIR, name)
+    for _, suffix in ipairs({'', '.previous', '.incoming'}) do
+        pcall(fs.remove, target .. suffix)
+    end
+end
+local function gts_auto_backup_audio(key, name)
+    if not gts_auto_cache_name(key, name) then return false end
+    pcall(fs.create_directories, AUTO_BACKUP_DIR)
+    pcall(fs.create_directories, AUTO_TRACK_DIR)
+    local src = join(AUDIO_DIR, name)
+    local dst = join(AUTO_TRACK_DIR, name)
+    return gts_auto_copy_audio(src, dst)
+end
+local function gts_auto_restore_index()
+    if type(safe_decode(read_file(CACHE_FILE))) == 'table' then return end
+    for _, backup in ipairs({AUTO_INDEX_FILE, AUTO_PREVIOUS_INDEX_FILE}) do
+        local bytes = read_file(backup)
+        if bytes and type(safe_decode(bytes)) == 'table' then
+            if write_file_atomic(CACHE_FILE, bytes) then
+                logger:warn('Restored downloaded-theme cache index from persistent backup')
+                return
+            end
+        end
+    end
+end
+local function gts_auto_reconcile_tracks()
+    pcall(fs.create_directories, AUTO_BACKUP_DIR)
+    pcall(fs.create_directories, AUTO_TRACK_DIR)
+    pcall(fs.create_directories, AUDIO_DIR)
+    for key, entry in pairs(cache) do
+        local name = type(entry) == 'table' and entry.file or nil
+        if gts_auto_cache_name(key, name) then
+            local live = join(AUDIO_DIR, name)
+            local mirror = join(AUTO_TRACK_DIR, name)
+            -- Remove an old recovery generation only if it is byte-for-byte
+            -- identical to a verified current mirror. Different songs and all
+            -- unindexed historical files are intentionally retained.
+            if looks_like_audio(mirror) and looks_like_audio(mirror .. '.previous')
+                and gts_auto_same_audio(mirror, mirror .. '.previous') then
+                pcall(fs.remove, mirror .. '.previous')
+            end
+            if not looks_like_audio(mirror) and looks_like_audio(mirror .. '.previous') then
+                gts_auto_copy_audio(mirror .. '.previous', mirror)
+            end
+            if not looks_like_audio(live) and looks_like_audio(mirror) then
+                if gts_auto_copy_audio(mirror, live) then
+                    logger:warn('Restored downloaded theme audio for app ' .. key)
+                end
+            elseif looks_like_audio(live) and not looks_like_audio(mirror) then
+                gts_auto_backup_audio(key, name)
+            end
+        end
+    end
+    local bytes = read_file(CACHE_FILE)
+    if bytes and type(safe_decode(bytes)) == 'table' then
+        write_file_atomic(AUTO_INDEX_FILE, bytes)
+    end
+end
 local function download_file(key, ext, url, ua, headers)
     if not fs or not http or not http.download then return nil, "download_unsupported" end
     pcall(fs.create_directories, AUDIO_DIR)
@@ -1226,111 +1401,1060 @@ local function run_io(name, fn)
   return res
 end
 
-local function resolve_theme(app_id, force_refresh, game_name, exclude)
-    if resolve_busy then return json.encode({ ok = false, error = "busy" }) end
-    resolve_busy = true
-    local key = tostring(app_id)
-    if ignored[key] then
-    resolve_busy = false
-    return json.encode({ ok = false, error = "ignored" })
-end
-    game_name = native_string(game_name or "", 300)
-    local is_reroll = type(exclude) == "string" and exclude ~= ""
-    local prev = read_file(RESOLVE_MARKER)
-    if prev and prev ~= "" and prev == key and not is_reroll then
-        pcall(os.remove, RESOLVE_MARKER)
-        cache[key] = nil
-        mem_cache.soundtrack = {}
-        mem_cache.khinsider = {}
-        mem_cache.track_mp3 = {}
-        save_cache()
-        resolve_busy = false
-        return json.encode({ ok = false, error = "skipped_after_crash" })
-    end
-    write_file(RESOLVE_MARKER, key)
-    local ok, result = pcall(function()
-        if not game_name or game_name == "" then return json.encode({ ok = false, error = "missing_game_name" }) end
-        local key = tostring(app_id)
-        local exclude_set = build_exclude(exclude)
-        local rerolling = next(exclude_set) ~= nil
-        local cust = custom[key]
-        if not rerolling and cust and cust.file and fs and fs.exists and fs.exists(join(AUDIO_DIR, cust.file)) then
-            local url = LOOPBACK_BASE .. cust.file .. "?v=" .. tostring(cust.ts or 0)
-            return json.encode({ ok = true, url = url, title = cust.title, cached = true, custom = true })
-        end
-        
-        local entry = cache[key]
-        local NOT_FOUND_TTL = 6 * 3600
-    if not force_refresh and not rerolling and entry and entry.not_found then
-    if (os.time() - (entry.ts or 0)) < NOT_FOUND_TTL then
-        local fb = try_fallback()
-        if fb then return fb end
-        return json.encode({ ok = false, error = "not_found_cached" })
-    end
-    cache[key] = nil
-    entry = nil
-end
-        if not force_refresh and not rerolling and entry and entry.file and fs and fs.exists and fs.exists(join(AUDIO_DIR, entry.file)) then
-        if (entry.name or "") == "" and game_name ~= "" then
-        entry.name = sanitize_text(game_name)
-        save_cache()
-        end
-        local url = LOOPBACK_BASE .. entry.file .. "?v=" .. tostring(entry.ts or 0)
-        return json.encode({ ok = true, url = url, title = entry.title, cached = true })
-        end
-        local target_slot = "a"
-        if rerolling then
-            target_slot = (entry and entry.slot == "b") and "a" or "b"
-        end
-        local dl_base = target_slot == "b" and (key .. "_b") or key
-        local variants = name_variants(game_name)
-        local r = local_resolve(game_name, key, exclude_set, dl_base)
-        local kh_err
-        if not (r and r.file) then
-            for _, q in ipairs(variants) do
-                r, kh_err = khinsider_resolve(q, key, exclude_set, dl_base)
-                if r and r.file then break end
-            end
-        end
-        local ia_err
-        if not (r and r.file) then
-            r, ia_err = ia_resolve(game_name, key, exclude_set, dl_base)
-        end
-        if not (r and r.file) then
-            local sc_err
-            for _, q in ipairs(variants) do
-                r, sc_err = sc_resolve(q, key, exclude_set, dl_base)
-                if r and r.file then break end
-            end
-            if not (r and r.file) then
-local err_code = sc_err or kh_err or "not_found"
-if rerolling then err_code = "no_alternative" end
-if not rerolling then
-    cache[key] = { not_found = true, ts = os.time() }
-    save_cache()
-end
-local fb = try_fallback()
-if fb then return fb end
-logger:warn("no theme audio for " .. tostring(game_name) .. " (khinsider: " .. tostring(kh_err) .. ", soundcloud: " .. tostring(sc_err) .. ")")
-return json.encode({ ok = false, error = err_code })
-            end
-        end
-            local ts = os.time()
-        local other_base = target_slot == "b" and key or (key .. "_b")
-        for _, e in ipairs(AUDIO_EXTS) do pcall(fs.remove, join(AUDIO_DIR, other_base .. "." .. e)) end
-        cache[key] = { file = r.file, title = sanitize_text(r.title), name = sanitize_text(game_name), ts = ts, slot = target_slot }
-        save_cache()
-        local url = LOOPBACK_BASE .. r.file .. "?v=" .. tostring(ts)
-        return json.encode({ ok = true, url = url, title = sanitize_text(r.title), cached = false })
-    end)
-    pcall(os.remove, RESOLVE_MARKER)
-    resolve_busy = false
-    collectgarbage("collect")
-    collectgarbage("collect")
-    if not ok then logger:warn("resolve_theme crashed: " .. tostring(result)); return json.encode({ ok = false, error = "internal_error" }) end
-    return result
+-- Game Theme Song v20: YouTube-only ranked automatic soundtrack discovery.
+-- Do not call any of the old Khinsider/Internet Archive/SoundCloud resolvers.
+-- yt-dlp is a local dependency, and only canonical 11-character video IDs are downloaded.
+local gts20_sessions = {}
+local gts20_last_check = 0
+local gts20_executable = nil
+local GTS20_AUTO_SCORE = 98
+local GTS20_GAP_SCORE = 12
+
+local function gts20_valid_app(app_id)
+    local key = tostring(app_id or '')
+    if not key:match('^%d+$') or #key > 12 or tonumber(key) == 0 then return nil end
+    return key
 end
 
+local function gts20_exe()
+    if SEP ~= '\\' or not fs or not utils or type(utils.exec) ~= 'function' then return nil end
+    if gts20_executable then return gts20_executable end
+    local path = join(DATA_DIR, 'yt-dlp.exe')
+    local exe = (fs.exists and fs.exists(path)) and ('"' .. path .. '"') or 'yt-dlp'
+    local _, status = utils.exec(exe .. ' --version')
+    if status == 0 then gts20_executable = exe; return exe end
+    return nil
+end
+
+local function gts20_safe_path(stem)
+    -- cmd.exe expands % and ! even in double-quoted strings.
+    return not stem:find('["%%!\r\n]')
+end
+
+local function gts20_safe_name(game_name)
+    local raw = sanitize_text(game_name or '', 130)
+    local clean = raw:gsub('[^%w%s%-]', ' '):gsub('%s+', ' '):match('^%s*(.-)%s*$') or ''
+    if #clean < 3 then return nil end
+    return clean:sub(1, 90)
+end
+
+local function gts20_lower(text)
+    return tostring(text or ''):lower():gsub('[^%w]+', ' '):gsub('%s+', ' '):match('^%s*(.-)%s*$') or ''
+end
+
+local function gts20_score(candidate, game_name)
+    local title = gts20_lower(candidate.title)
+    local game = gts20_lower(game_name)
+    if game == '' or title == '' then return -1000, false end
+    local game_tokens, relevant, total = {}, 0, 0
+    for token in game:gmatch('%S+') do
+        if #token > 2 and token ~= 'the' and token ~= 'and' and token ~= 'edition' and token ~= 'game' then
+            game_tokens[#game_tokens + 1] = token
+        end
+    end
+    for _, token in ipairs(game_tokens) do
+        total = total + 1
+        if title:find('%f[%w]' .. token .. '%f[%W]') then relevant = relevant + 1 end
+    end
+    if total == 0 then return -1000, false end
+    local coverage = relevant / total
+    if coverage < 0.85 then return -1000, false end
+    local full_name = title:find(game, 1, true) ~= nil
+    local score = (full_name and 52 or 20) + math.floor(coverage * 28)
+    -- Put actual main-menu/main-theme tracks before generic OST uploads.
+    -- Game-title coverage must still pass the existing relevance gate.
+    local preferred = title:find('main menu', 1, true) or title:find('main theme', 1, true)
+    local other_theme = title:find('title theme', 1, true) or title:find('title screen', 1, true)
+       or title:find('opening theme', 1, true)
+    if preferred then score = score + 84
+    elseif other_theme then score = score + 32 end
+    if title:find('%f[%w]ost%f[%W]') then score = score + 18 end
+    if title:find('original soundtrack', 1, true) then score = score + 16 end
+    if title:find('official soundtrack', 1, true) then score = score + 17 end
+    if title:find('soundtrack', 1, true) then score = score + 8 end
+    if title:find('theme', 1, true) then score = score + 6 end
+    local uploader = gts20_lower(candidate.uploader)
+    if uploader:find('official', 1, true) then score = score + 7 end
+    local penalties = {
+      'remix', 'cover', 'reaction', 'review', 'gameplay', 'walkthrough', 'playthrough',
+      'trailer', 'tutorial', 'comparison', 'ranking', 'compilation', 'full album',
+      'complete ost', 'full ost', 'full soundtrack', 'extended', 'one hour', '1 hour',
+      '10 hour', 'slowed', 'nightcore', 'fanmade', 'fan made', 'ai generated'
+    }
+    local bad = false
+    for _, term in ipairs(penalties) do
+      if title:find(term, 1, true) then score = score - 75; bad = true end
+    end
+    local length = tonumber(candidate.duration) or 0
+    if length <= 0 or length > 900 then score = score - 55 end
+    if length >= 45 and length <= 480 then score = score + 9 end
+    -- v20.2: user-selected confidence rule. The video title must explicitly
+    -- contain the complete game's name AND either 'OST' or 'soundtrack'.
+    -- Ranking still prefers main themes and penalizes non-OST material.
+    local has_soundtrack_keyword = title:find('%f[%w]ost%f[%W]') ~= nil
+      or title:find('%f[%w]soundtrack%f[%W]') ~= nil
+    local qualified = full_name and has_soundtrack_keyword
+    return score, qualified
+end
+
+-- An explicit manual search is deliberately different from automatic detection:
+-- results need not contain Steam's game title, and can NEVER auto-download.
+-- Restrict characters before building a Windows shell command for yt-dlp.
+local function gts20_manual_query(input)
+    if type(input) ~= 'string' then return nil end
+    if #input > 300 then return nil end
+    local clean = input:gsub('[^%w%s%-]', ' '):gsub('%s+', ' '):match('^%s*(.-)%s*$') or ''
+    if #clean < 2 or #clean > 120 then return nil end
+    return clean
+end
+
+local function gts20_custom_score(candidate, query)
+    local title = gts20_lower(candidate.title)
+    local wanted = gts20_lower(query)
+    local total, matched = 0, 0
+    for token in wanted:gmatch('%S+') do
+        if #token >= 2 then
+            total = total + 1
+            if title:find('%f[%w]' .. token .. '%f[%W]') then matched = matched + 1 end
+        end
+    end
+    local score = total > 0 and math.floor(75 * matched / total) or 0
+    if title:find(wanted, 1, true) then score = score + 30 end
+    if title:find('main menu', 1, true) or title:find('main theme', 1, true) then
+        score = score + 50
+    end
+    if title:find('remix', 1, true) or title:find('reaction', 1, true)
+        or title:find('review', 1, true) or title:find('gameplay', 1, true) then
+        score = score - 45
+    end
+    local duration = tonumber(candidate.duration) or 0
+    if duration > 900 then score = score - 35 end
+    if duration >= 45 and duration <= 480 then score = score + 8 end
+    return score
+end
+
+-- v3.0.0 audit fix 2: ONLY YouTube search/full-download scratch files.
+-- Never sweep AUDIO_DIR, cache.json, custom songs or persistent auto backups.
+local gts20_work_dir = join(DATA_DIR, 'gts20_work_scratch')
+local gts20_work_sequence = 0
+
+local function gts20_work_scan(dir, predicate)
+    if not fs or type(fs.list) ~= 'function' then return false end
+    local ok, entries = pcall(fs.list, dir)
+    if not ok or type(entries) ~= 'table' then return false end
+    for _, item in ipairs(entries) do
+        local name = type(item) == 'table' and item.name or nil
+        if item.is_file and type(name) == 'string'
+           and not name:find('/', 1, true)
+           and not name:find(string.char(92), 1, true)
+           and predicate(name) then
+            pcall(fs.remove, join(dir, name))
+        end
+    end
+    return true
+end
+
+local function gts20_work_cleanup(stem, kind)
+    local dir = gts20_work_dir
+    local normalized = stem:gsub(string.char(92), '/')
+    local prefix = (normalized:match('([^/]+)$') or normalized) .. '.'
+    gts20_work_scan(dir, function(name)
+        return name:sub(1, #prefix) == prefix
+    end)
+    -- If this Millennium build lacks fs.list, remove the supported yt-dlp
+    -- formats and common sidecars directly. A later startup sweep covers any
+    -- unknown sidecars once directory listing becomes available.
+    if kind == 'audio' then
+        for _, suffix in ipairs({'m4a', 'webm', 'mp3', 'ogg', 'wav', 'flac',
+            'opus', 'mp4', 'mkv', 'part', 'ytdl', 'info.json',
+            'm4a.part', 'webm.part', 'mp3.part', 'ogg.part', 'opus.part', 'oldcustom', 'oldbackup'}) do
+            pcall(fs.remove, stem .. '.' .. suffix)
+        end
+    else
+        pcall(fs.remove, stem .. '.json')
+    end
+end
+
+-- These are artifacts of our *previous versions*, which placed transient
+-- files directly in DATA_DIR. Match those exact naming schemes only.
+-- The new scratch folder contains only our own recognizable job files.
+do
+    gts20_work_scan(gts20_work_dir, function(name)
+        return name:match('^gts20_search_%d+_%d+_%d+%..+$') ~= nil
+            or name:match('^gts20_audio_%d+_%d+_%d+_%d+%..+$') ~= nil
+    end)
+    gts20_work_scan(DATA_DIR, function(name)
+        return name:match('^gts20_search_%d+_%d+%.json$') ~= nil
+            or name:match('^gts20_audio_%d+_%d+%..+$') ~= nil
+    end)
+end
+
+local function gts20_work_new(kind, key)
+    local ok = pcall(fs.create_directories, gts20_work_dir)
+    if not ok or not fs.exists(gts20_work_dir) then
+        return nil, 'download_temp_dir_unavailable'
+    end
+    gts20_work_sequence = gts20_work_sequence + 1
+    -- The counter keeps consecutive jobs unique; the clock/random suffix
+    -- also distinguishes attempts across process restarts within one second.
+    local suffix = tostring(os.time()) .. '_' .. tostring(gts20_work_sequence)
+        .. '_' .. tostring(math.floor(os.clock() * 1000000))
+        .. tostring(math.random(100000, 999999))
+    local basename = (kind == 'audio' and ('gts20_audio_' .. key)
+        or 'gts20_search') .. '_' .. suffix
+    local stem = join(gts20_work_dir, basename)
+    if not gts20_safe_path(stem) then return nil, 'unsupported_install_path' end
+    return stem
+end
+
+local function gts20_collect_results(game_name, custom_query)
+    local name = gts20_safe_name(game_name)
+    if not name then return nil, 'search_title_unsupported' end
+    local exe = gts20_exe()
+    if not exe then return nil, 'yt_dlp_missing' end
+    ensure_data_dir()
+    local manual = custom_query ~= nil and custom_query ~= ''
+    local search_queries
+    if manual then
+        local query = gts20_manual_query(custom_query)
+        if not query then return nil, 'invalid_custom_search' end
+        search_queries = {query}
+    else
+        search_queries = {
+            name .. ' main menu ost',
+            name .. ' main theme ost',
+            name .. ' official soundtrack main menu',
+            name .. ' title screen theme'
+        }
+    end
+    local found, ids = {}, {}
+    for index, query in ipairs(search_queries) do
+        local stem, stem_err = gts20_work_new('search')
+        if not stem then return nil, stem_err end
+        local metadata_path = stem .. '.json'
+        local limit = manual and 15 or 7
+        local cmd = exe .. ' --ignore-errors --quiet --no-warnings --flat-playlist'
+           .. ' --dump-single-json --socket-timeout 15 --retries 1 --playlist-end ' .. limit
+           .. ' "ytsearch' .. limit .. ':' .. query .. '" > "' .. metadata_path .. '"'
+        -- Even an exception in the shell or JSON parser must not strand a job.
+        local ran, _, status = pcall(utils.exec, cmd)
+        local decoded_ok, data = pcall(function()
+            if ran and status == 0 then return safe_decode(read_file(metadata_path) or '') end
+            return nil
+        end)
+        gts20_work_cleanup(stem, 'search')
+        if not decoded_ok then data = nil end
+        if type(data) == 'table' and type(data.entries) == 'table' then
+            for _, item in ipairs(data.entries) do
+                if type(item) == 'table' then
+                    local id = tostring(item.id or '')
+                    if #id == 11 and id:match('^[A-Za-z0-9_-]+$') and not ids[id] then
+                        ids[id] = true
+                        local cand = {
+                            id = id, title = sanitize_text(item.title or '', 190),
+                            uploader = sanitize_text(item.uploader or item.channel or '', 100),
+                            duration = tonumber(item.duration) or 0
+                        }
+                        cand.score, cand.qualified = gts20_score(cand, name)
+                        if manual then
+                            -- Relevance to the hand-written query can outrank the
+                            -- game's name, but results always require confirmation.
+                            cand.score = gts20_custom_score(cand, query)
+                                + (cand.score > -300 and 18 or 0)
+                            cand.qualified = false
+                            found[#found + 1] = cand
+                        elseif cand.score > -300 then
+                            found[#found + 1] = cand
+                        end
+                    end
+                end
+            end
+        end
+    end
+    table.sort(found, function(a, b)
+        if a.score ~= b.score then return a.score > b.score end
+        return a.id < b.id
+    end)
+    while #found > 12 do table.remove(found) end
+    if #found == 0 then return nil, 'youtube_no_results' end
+    return found, nil
+end
+
+-- v3.0.0 audit fix 3: bounded, lazy search-session retention.
+-- Keep the existing 4-minute result reuse and 15-minute preview/approval
+-- authorization. No periodic timer, file I/O, or theme-cache modification.
+local GTS20_SESSION_TTL = 900
+local GTS20_SESSION_LIMIT = 64
+local gts20_session_access = 0
+
+local function gts20_touch_session(session)
+    gts20_session_access = gts20_session_access + 1
+    session.last_access = gts20_session_access
+end
+
+local function gts20_prune_sessions()
+    local now = os.time()
+    local retained = {}
+    for key, session in pairs(gts20_sessions) do
+        local stamp = type(session) == 'table' and tonumber(session.ts) or nil
+        if not stamp or stamp > now or now - stamp >= GTS20_SESSION_TTL then
+            gts20_sessions[key] = nil
+        else
+            retained[#retained + 1] = {
+                key = key, stamp = stamp, access = tonumber(session.last_access) or 0
+            }
+        end
+    end
+    if #retained <= GTS20_SESSION_LIMIT then return end
+    -- Evict least-recently-used sessions only when under pressure. Sorting
+    -- provides predictable results without a potentially expensive O(n^2)
+    -- scan when upgrading from an older unbounded session table.
+    table.sort(retained, function(a, b)
+        if a.access ~= b.access then return a.access < b.access end
+        if a.stamp ~= b.stamp then return a.stamp < b.stamp end
+        return tostring(a.key) < tostring(b.key)
+    end)
+    for i = 1, #retained - GTS20_SESSION_LIMIT do
+        gts20_sessions[retained[i].key] = nil
+    end
+end
+
+local function gts20_candidates(app_id, game_name, refresh, custom_query)
+    local key = gts20_valid_app(app_id)
+    if not key then return nil, 'invalid_app_id' end
+    gts20_prune_sessions()
+    local query = custom_query or ''
+    local previous = gts20_sessions[key]
+    if not refresh and previous and previous.name == game_name
+        and (previous.query or '') == query and os.time() - previous.ts < 240 then
+        gts20_touch_session(previous)
+        return previous.items, nil
+    end
+    local items, err = gts20_collect_results(game_name, query)
+    if items then
+        local session = {name = game_name, query = query, items = items, ts = os.time()}
+        gts20_touch_session(session)
+        gts20_sessions[key] = session
+        gts20_prune_sessions()
+    end
+    return items, err
+end
+
+-- v3.0.0 audit fix 9: copy audio in 256 KiB chunks. Never hold
+-- the full downloaded/new/previous tracks simultaneously in Lua memory.
+local function gts20_stream_copy(src, dst)
+    local input = io.open(src, 'rb')
+    if not input then return false end
+    local output = io.open(dst, 'wb')
+    if not output then input:close(); return false end
+    local ok, length = pcall(function()
+        local total = 0
+        while true do
+            local chunk = input:read(262144)
+            if not chunk then break end
+            if #chunk == 0 then break end
+            if not output:write(chunk) then return -1 end
+            total = total + #chunk
+            if total > 50 * 1024 * 1024 then return -1 end
+        end
+        return total
+    end)
+    pcall(function() input:close() end)
+    pcall(function() output:close() end)
+    if not ok or length < 1024 then
+        pcall(fs.remove, dst)
+        return false
+    end
+    return true
+end
+local function gts20_download(app_id, game_name, video_id, title, as_custom)
+    local key = gts20_valid_app(app_id)
+    if not key then return nil, 'invalid_app_id' end
+    if type(video_id) ~= 'string' or #video_id ~= 11 or not video_id:match('^[A-Za-z0-9_-]+$') then
+        return nil, 'invalid_video_id'
+    end
+    local exe = gts20_exe()
+    if not exe then return nil, 'yt_dlp_missing' end
+    local old = cache[key]
+    local slot = old and old.slot == 'b' and 'a' or 'b'
+    local base = slot == 'b' and (key .. '_b') or key
+    local temp_stem, stem_err = gts20_work_new('audio', key)
+    if not temp_stem then return nil, stem_err end
+    local function run_download_attempt()
+    local cmd = exe .. ' --quiet --no-warnings --no-playlist --no-progress --no-part'
+       .. ' --no-mtime --socket-timeout 20 --retries 2 --fragment-retries 2'
+       .. ' --max-filesize 45M -f "bestaudio[ext=m4a]/bestaudio"'
+       .. ' -o "' .. temp_stem .. '.%(ext)s"'
+       .. ' "https://www.youtube.com/watch?v=' .. video_id .. '"'
+    local ran, _, status = pcall(utils.exec, cmd)
+    local source, ext, failure
+    if not ran or status ~= 0 then
+        failure = 'youtube_download_failed'
+    else
+        for _, e in ipairs({'m4a','webm','mp3','ogg','wav','flac'}) do
+            local candidate = temp_stem .. '.' .. e
+            if fs.exists(candidate) then source, ext = candidate, e; break end
+        end
+        if not source then
+            failure = 'youtube_download_failed'
+        else
+            local checked, valid = pcall(function()
+                local opened = io.open(source, 'rb')
+                if not opened then return false end
+                local size = opened:seek('end') or 0
+                opened:close()
+                return size >= 1024 and size <= 50 * 1024 * 1024
+            end)
+            if not checked or not valid then failure = 'invalid_audio_size' end
+        end
+    end
+    if failure then return nil, failure end
+    -- Manual confirmation keeps its proven atomic destination/backup writes.
+    -- Buffer ONLY the newly selected track (<=50 MiB); prior songs/backup
+    -- are snapshotted to scratch files instead of full Lua strings.
+    local bytes = nil
+    if as_custom then
+        local opened = io.open(source, 'rb')
+        if not opened then return nil, 'download_unreadable' end
+        local ok_read, content = pcall(function() return opened:read('*a') end)
+        pcall(function() opened:close() end)
+        if not ok_read or not content or #content < 1024
+            or #content > 50 * 1024 * 1024 then return nil, 'invalid_audio_size' end
+        bytes = content
+    end
+    pcall(fs.create_directories, AUDIO_DIR)
+    -- A manually confirmed choice is a CUSTOM theme, unlike automatic search.
+    -- The same verified full download is reused; no nested FFI calls or second
+    -- yt-dlp invocation, and the existing preview API remains untouched.
+    if as_custom then
+        -- Only use Lua locals defined ABOVE gts20_download. The v20.9.1 and
+        -- v20.9.2 errors came from referencing late local declarations.
+        local allowed = {m4a=true, webm=true, mp3=true, ogg=true, wav=true, flac=true}
+        if not allowed[ext] then return nil, 'unsupported_format' end
+        local filename = 'custom_' .. key .. '.' .. ext
+        local destination = join(AUDIO_DIR, filename)
+        local backup_path = join(CUSTOM_BACKUP_DIR, filename)
+        local staged = join(AUDIO_DIR, 'gts20_custom_staged_' .. key .. '.' .. ext)
+        pcall(fs.create_directories, CUSTOM_BACKUP_DIR)
+        -- Validate a distinct staging file before touching an existing song.
+        if not gts20_stream_copy(source, staged) then return nil, 'audio_write_failed' end
+        local valid = looks_like_audio(staged)
+        pcall(fs.remove, staged)
+        if not valid then return nil, 'invalid_audio_file' end
+
+        -- Preserve existing files and both state manifests until the new audio
+        -- and its backup are safely written. A failed commit rolls back.
+        local former_song = custom[key]
+        local former_audio = fs.exists(destination) and (temp_stem .. '.oldcustom') or nil
+        local former_backup = fs.exists(backup_path) and (temp_stem .. '.oldbackup') or nil
+        -- Snapshot existing audio before any overwrite; failures are non-destructive.
+        if former_audio and not gts20_stream_copy(destination, former_audio) then
+            return nil, 'custom_snapshot_failed'
+        end
+        if former_backup and not gts20_stream_copy(backup_path, former_backup) then
+            return nil, 'custom_snapshot_failed'
+        end
+        local former_custom_json = read_file(CUSTOM_FILE)
+        local former_backup_json = read_file(CUSTOM_BACKUP_FILE)
+        local function restore(path, previous)
+            if previous then
+                if path == destination or path == backup_path then
+                    return gts20_stream_copy(previous, path)
+                end
+                return write_file_atomic(path, previous)
+            end
+            pcall(fs.remove, path)
+            return true
+        end
+        local function rollback()
+            custom[key] = former_song
+            restore(destination, former_audio)
+            restore(backup_path, former_backup)
+            restore(CUSTOM_FILE, former_custom_json)
+            restore(CUSTOM_BACKUP_FILE, former_backup_json)
+        end
+        if not write_file_atomic(destination, bytes) or not looks_like_audio(destination) then
+            restore(destination, former_audio)
+            return nil, 'custom_write_failed'
+        end
+        if not write_file_atomic(backup_path, bytes) or not looks_like_audio(backup_path) then
+            restore(destination, former_audio)
+            restore(backup_path, former_backup)
+            return nil, 'custom_backup_failed'
+        end
+
+        local stamp = os.time()
+        local selected_title = sanitize_text(title or 'YouTube theme', 100)
+        custom[key] = {file=filename, title=selected_title,
+            name=sanitize_text(game_name or '', 200), ts=stamp}
+        local state = safe_encode(custom)
+        if not state or not write_file_atomic(CUSTOM_FILE, state)
+            or not write_file_atomic(CUSTOM_BACKUP_FILE, state) then
+            rollback()
+            return nil, 'custom_metadata_failed'
+        end
+        custom_list_cache = nil
+        -- Only after the custom replacement is persisted, retire old formats.
+        for oldext in pairs(allowed) do
+            if oldext ~= ext then
+                pcall(fs.remove, join(AUDIO_DIR, 'custom_' .. key .. '.' .. oldext))
+                pcall(fs.remove, join(CUSTOM_BACKUP_DIR, 'custom_' .. key .. '.' .. oldext))
+            end
+        end
+        -- Clear the automatic download only after the manual override succeeds.
+        local old_cache = cache[key]
+        if old_cache then
+            cache[key] = nil
+            save_cache()
+            local old_name = tostring(old_cache.file or '')
+            local matching_name = (old_name:match('^(%d+)%.[%w]+$') == key)
+                or (old_name:match('^(%d+)_b%.[%w]+$') == key)
+            if matching_name and old_name ~= filename then
+                pcall(fs.remove, join(AUDIO_DIR, old_name))
+                gts_auto_forget_audio(key, old_name)
+            end
+        end
+        return {ok=true, url=LOOPBACK_BASE .. filename .. '?v=' .. stamp,
+            title=selected_title, cached=false, custom=true, source='youtube_manual'}, nil
+    end
+    local filename = base .. '.' .. ext
+    local dest = join(AUDIO_DIR, filename)
+    if not gts20_stream_copy(source, dest) then return nil, 'audio_write_failed' end
+    local valid = looks_like_audio(dest)
+    if not valid then pcall(fs.remove, dest); return nil, 'invalid_audio_file' end
+    -- Keep a durable copy before publishing a new automatic cache entry.
+    if not gts_auto_backup_audio(key, filename) then
+        pcall(fs.remove, dest)
+        return nil, 'persistent_cache_backup_failed'
+    end
+    -- Update cache only once the new file is complete and validated.
+    local timestamp = os.time()
+    cache[key] = {file = filename, title = sanitize_text(title or 'YouTube theme'),
+      name = sanitize_text(game_name), ts = timestamp, slot = slot,
+      source = 'youtube_v20', video_id = video_id}
+    if not save_cache() then
+        -- Keep the already validated audio in place: the durable index may
+        -- already contain the new entry and can recover the next startup.
+        return nil, 'cache_metadata_save_failed'
+    end
+    return {ok = true, url = LOOPBACK_BASE .. filename .. '?v=' .. timestamp,
+      title = cache[key].title, cached = false, source = 'youtube_v20'}, nil
+    end
+    local ran_ok, result, reason = pcall(run_download_attempt)
+    gts20_work_cleanup(temp_stem, 'audio')
+    if not ran_ok then return nil, 'download_commit_failed' end
+    return result, reason
+end
+local function resolve_theme(app_id, force_refresh, game_name, exclude)
+    if resolve_busy then return json.encode({ok = false, error = 'busy'}) end
+    resolve_busy = true
+    local ok, result = pcall(function()
+        local key = gts20_valid_app(app_id)
+        if not key then return {ok=false, error='invalid_app_id'} end
+        if ignored[key] then return {ok=false, error='ignored'} end
+        game_name = native_string(game_name or '', 300)
+        if game_name == '' then return {ok=false, error='missing_game_name'} end
+        local rerolling = (type(exclude) == 'string' and exclude ~= '')
+        local custom_song = custom[key]
+        if custom_song and custom_song.file and fs.exists(join(AUDIO_DIR, custom_song.file)) then
+            return {ok=true, url=LOOPBACK_BASE .. custom_song.file .. '?v=' .. tostring(custom_song.ts or 0),
+              title=custom_song.title, cached=true, custom=true}
+        end
+        local entry = cache[key]
+        if not force_refresh and not rerolling and entry and entry.source == 'youtube_v20'
+            and entry.file and fs.exists(join(AUDIO_DIR, entry.file)) then
+            return {ok=true, url=LOOPBACK_BASE .. entry.file .. '?v=' .. tostring(entry.ts or 0),
+              title=entry.title, cached=true}
+        end
+        local items, err = gts20_candidates(app_id, game_name, false)
+        if not items then
+            if err == 'youtube_no_results' then
+                local fallback = try_fallback()
+                if fallback then return safe_decode(fallback) end
+            end
+            return {ok=false, error=err or 'youtube_search_failed'}
+        end
+        local excludes = build_exclude(exclude)
+        local eligible = {}
+        for _, item in ipairs(items) do
+            if not is_excluded(excludes, item.title) then eligible[#eligible+1] = item end
+        end
+        if #eligible == 0 then return {ok=false, error='youtube_no_alternative'} end
+        -- Take the highest-ranked candidate that satisfies the explicit
+        -- game-title + OST/soundtrack rule. No score gap is required.
+        local confident
+        for _, item in ipairs(eligible) do
+            if item.qualified then confident = item; break end
+        end
+        if confident then
+            local downloaded, download_err = gts20_download(app_id, game_name, confident.id, confident.title)
+            if downloaded then return downloaded end
+            return {ok=false, error=download_err or 'youtube_download_failed', candidates=eligible}
+        end
+        -- Explicit approval required before downloading any low-confidence match.
+        return {ok=false, error='youtube_needs_confirmation', candidates=eligible}
+    end)
+    resolve_busy = false
+    if not ok then
+        logger:warn('v20 YouTube resolve crashed: ' .. tostring(result))
+        return json.encode({ok=false, error='internal_error'})
+    end
+    return json.encode(result)
+end
+
+---@ffi
+---Find ranked YouTube candidates, optionally using a manually entered query.
+---@param app_id number Steam app id
+---@param game_name string Steam game name (for assignment and automatic searches)
+---@param custom_query string Optional text to search instead of generated game queries
+---@return string JSON {ok, candidates, error}
+function youtube_v20_search(app_id, game_name, custom_query)
+    if resolve_busy or io_busy then return json.encode({ok=false, error='busy'}) end
+    local key = gts20_valid_app(app_id)
+    if not key then return json.encode({ok=false,error='invalid_app_id'}) end
+    if ignored[key] then return json.encode({ok=false,error='ignored'}) end
+    game_name = native_string(game_name or '', 300)
+    local requested = type(custom_query) == 'string' and custom_query ~= ''
+    local query = ''
+    if requested then
+        query = gts20_manual_query(custom_query)
+        if not query then return json.encode({ok=false,error='invalid_custom_search'}) end
+    end
+    -- Explicit searches bypass the automatic result cache; normal searches
+    -- still reuse it. Session IDs remain authorized for preview/confirmation.
+    local ok, items, err = pcall(gts20_candidates, app_id, game_name, requested, query)
+    if not ok then return json.encode({ok=false,error='internal_error'}) end
+    if not items then return json.encode({ok=false,error=err}) end
+    return json.encode({ok=true, candidates=items})
+end
+
+---@ffi
+---Assign a manually approved YouTube result as a custom track.
+---@param app_id number Steam app id
+---@param game_name string Steam game name
+---@param video_id string One of the returned candidate IDs
+---@return string JSON {ok, error}
+function youtube_v20_assign(app_id, game_name, video_id)
+    if resolve_busy or io_busy then return json.encode({ok=false,error='busy'}) end
+    local key = gts20_valid_app(app_id)
+    if not key or ignored[key] then return json.encode({ok=false,error='ignored_or_invalid'}) end
+    gts20_prune_sessions()
+    local session = gts20_sessions[key]
+    if not session or session.name ~= game_name or os.time() - session.ts >= 900 then
+        return json.encode({ok=false,error='search_expired'})
+    end
+    local chosen
+    for _, item in ipairs(session.items) do
+        if item.id == video_id then chosen = item; break end
+    end
+    if not chosen then return json.encode({ok=false,error='not_in_search_results'}) end
+    gts20_touch_session(session)
+    resolve_busy = true
+    local ok, result, err = pcall(gts20_download, app_id, game_name, video_id, chosen.title, true)
+    if ok and result and result.ok then gts20_sessions[key] = nil end
+    resolve_busy = false
+    if not ok then logger:warn('v20 YouTube assignment failed: ' .. tostring(result)); return json.encode({ok=false,error='internal_error'}) end
+    return json.encode(result or {ok=false,error=err or 'download_failed'})
+end
+
+
+-- v20.3: Local, deliberately short-lived 15-second audio previews.
+-- Preview files never enter 'cache', 'custom', or the full-track assignment path.
+-- Previews are cached only while the YouTube picker is in use. Each
+-- candidate has its own final MP3, so comparing results never redownloads it.
+-- A bounded per-game cache (max 16 short clips) protects disk space if a
+-- picker is kept open across multiple searches. Reboot removes orphan files.
+-- Keep private preview helpers in a separate function prototype. Lua limits
+-- each function (including the top-level chunk) to 200 simultaneously active
+-- locals. Do not promote them into the large plugin main chunk.
+-- The published @ffi endpoint functions below MUST remain top-level globals.
+GTS20_PREVIEW_CORE = (function()
+local gts20_preview_current = {} -- [app_id] = {[video_id] = true}
+local gts20_preview_order = {}   -- [app_id] = {oldest_video_id, ...}
+local gts20_preview_dirty = {}   -- [safe filename] = true
+local gts20_preview_busy = false
+local gts20_preview_registry = join(DATA_DIR, 'gts20_preview_registry.json')
+local gts20_preview_limit = 16
+
+local function gts20_preview_filename(key, video_id)
+    return 'gts20_preview_' .. key .. '_' .. video_id .. '.mp3'
+end
+
+local function gts20_preview_valid_video(video_id)
+    return type(video_id) == 'string' and #video_id == 11
+       and video_id:match('^[A-Za-z0-9_-]+$') ~= nil
+end
+
+local function gts20_preview_touch(key, video_id)
+    local by_game = gts20_preview_current[key] or {}
+    local order = gts20_preview_order[key] or {}
+    by_game[video_id] = true
+    for index = #order, 1, -1 do
+        if order[index] == video_id then table.remove(order, index) end
+    end
+    order[#order + 1] = video_id
+    gts20_preview_current[key], gts20_preview_order[key] = by_game, order
+end
+
+-- A successful remove is confirmed by existence, not by fs.remove's return
+-- value (filesystem implementations can return nil even on success).
+local function gts20_preview_remove(path)
+    local exists_ok, present = pcall(fs.exists, path)
+    if not exists_ok then return false end
+    if not present then return true end
+    for _ = 1, 2 do
+        pcall(fs.remove, path)
+        local check_ok, still_present = pcall(fs.exists, path)
+        if check_ok and not still_present then return true end
+    end
+    return false
+end
+
+local function gts20_preview_registry_save()
+    if next(gts20_preview_dirty) then
+        if not pcall(ensure_data_dir) then return false end
+        local encoded_ok, encoded = pcall(json.encode, gts20_preview_dirty)
+        if not encoded_ok then return false end
+        local ok, saved = pcall(write_file, gts20_preview_registry, encoded)
+        return ok and saved == true
+    end
+    return gts20_preview_remove(gts20_preview_registry)
+end
+
+local function gts20_preview_clear_file(key, video_id, defer_save)
+    -- The same result can be selected again; clearing one result is scoped
+    -- to its own file and cannot remove another candidate's clip.
+    if not gts20_preview_valid_video(video_id) then return false, 'invalid_video_id' end
+    local filename = gts20_preview_filename(key, video_id)
+    local removed = gts20_preview_remove(join(AUDIO_DIR, filename))
+    if removed then
+        local by_game = gts20_preview_current[key]
+        if by_game then
+            by_game[video_id] = nil
+            if not next(by_game) then gts20_preview_current[key] = nil end
+        end
+        local order = gts20_preview_order[key]
+        if order then
+            for index = #order, 1, -1 do
+                if order[index] == video_id then table.remove(order, index) end
+            end
+            if #order == 0 then gts20_preview_order[key] = nil end
+        end
+        gts20_preview_dirty[filename] = nil
+    else
+        gts20_preview_dirty[filename] = true
+    end
+    local persisted = defer_save or gts20_preview_registry_save()
+    if not removed then return false, 'preview_cleanup_failed' end
+    if not persisted then return false, 'preview_registry_write_failed' end
+    return true
+end
+
+-- v3.0.0 pre-release audit: confine yt-dlp/FFmpeg preview intermediates.
+-- No automatic theme, custom theme, or persistent-backup file lives here.
+local gts20_preview_scratch_dir = join(DATA_DIR, 'gts20_preview_scratch')
+local gts20_preview_job_sequence = 0
+
+local function gts20_preview_scan_files(dir, matches, on_result)
+    if not fs or type(fs.list) ~= 'function' then return false end
+    local ok, entries = pcall(fs.list, dir)
+    if not ok or type(entries) ~= 'table' then return false end
+    for _, item in ipairs(entries) do
+        local filename = type(item) == 'table' and item.name or nil
+        -- Never interpret directory names, nested paths, or unrelated files
+        -- as our scratch outputs, even if a filesystem API returns them.
+        if type(item) == 'table' and item.is_file and type(filename) == 'string'
+           and not filename:find('/', 1, true)
+           and not filename:find(string.char(92), 1, true)
+           and matches(filename) then
+            local removed = gts20_preview_remove(join(dir, filename))
+            if on_result then on_result(filename, removed) end
+        end
+    end
+    return true
+end
+
+-- No active picker exists after a process restart; clear legacy and new
+-- preview files even when registry writes were interrupted. Never scan
+-- cache.json, custom-song paths, or automatic-theme backup directories.
+do
+    local function valid_preview_name(name)
+        local legacy = name:match('^gts20_preview_(%d+)%.mp3$')
+        if legacy and gts20_valid_app(legacy) then return true end
+        local app, video = name:match('^gts20_preview_(%d+)_([A-Za-z0-9_-]+)%.mp3$')
+        return app ~= nil and gts20_valid_app(app) ~= nil and gts20_preview_valid_video(video)
+    end
+    local read_ok, registry_text = pcall(read_file, gts20_preview_registry)
+    local decoded_ok, old = pcall(safe_decode, read_ok and (registry_text or '') or '')
+    if decoded_ok and type(old) == 'table' then
+        for name, marked in pairs(old) do
+            if marked then
+                -- Previous builds indexed old previews by numeric AppID.
+                local filename = valid_preview_name(name) and name
+                    or (gts20_valid_app(name) and ('gts20_preview_' .. name .. '.mp3'))
+                if filename then
+                    local removed = gts20_preview_remove(join(AUDIO_DIR, filename))
+                    gts20_preview_dirty[name] = removed and nil or true
+                end
+            end
+        end
+    end
+    local scanned = gts20_preview_scan_files(AUDIO_DIR, valid_preview_name,
+        function(name, removed)
+            gts20_preview_dirty[name] = removed and nil or true
+        end)
+    if not scanned then
+        pcall(function() logger:warn('Preview startup cleanup could not enumerate preview clips; registry-only recovery remains active') end)
+    end
+    if not gts20_preview_registry_save() then
+        pcall(function() logger:warn('Preview cleanup registry update failed; will retry when possible') end)
+    end
+end
+
+-- A picker session finishes on Confirm, Cancel, Close, app change, or
+-- component disposal. Work only on this AppID's exact temporary filenames.
+local function gts20_preview_clear_app(key)
+    local ids = {}
+    for video in pairs(gts20_preview_current[key] or {}) do ids[video] = true end
+    local prefix = 'gts20_preview_' .. key .. '_'
+    for filename in pairs(gts20_preview_dirty) do
+        if filename:sub(1, #prefix) == prefix then
+            local video = filename:sub(#prefix + 1):match('^([A-Za-z0-9_-]+)%.mp3$')
+            if gts20_preview_valid_video(video) then ids[video] = true end
+        end
+    end
+    local ok, entries = pcall(fs.list, AUDIO_DIR)
+    if ok and type(entries) == 'table' then
+        for _, item in ipairs(entries) do
+            if type(item) == 'table' and item.is_file and type(item.name) == 'string'
+               and item.name:sub(1, #prefix) == prefix then
+                local video = item.name:sub(#prefix + 1):match('^([A-Za-z0-9_-]+)%.mp3$')
+                if gts20_preview_valid_video(video) then ids[video] = true end
+            end
+        end
+    end
+    local all_removed = true
+    for video in pairs(ids) do
+        local removed = gts20_preview_clear_file(key, video, true)
+        if not removed then all_removed = false end
+    end
+    -- Older releases used a single final MP3 per AppID.
+    local legacy = 'gts20_preview_' .. key .. '.mp3'
+    local legacy_removed = gts20_preview_remove(join(AUDIO_DIR, legacy))
+    if legacy_removed then gts20_preview_dirty[key] = nil
+    else gts20_preview_dirty[key] = true end
+    local persisted = gts20_preview_registry_save()
+    if not all_removed or not legacy_removed then return false, 'preview_cleanup_failed' end
+    if not persisted then return false, 'preview_registry_write_failed' end
+    return true
+end
+
+local function gts20_preview_is_orphan_name(filename, legacy)
+    -- Legacy v20.3 output lived immediately in DATA_DIR and had a two-part
+    -- suffix; new outputs have a four-part suffix in the scratch directory.
+    if legacy then return filename:match('^gts20_preview_build_%d+_%d+%..+$') ~= nil end
+    return filename:match('^gts20_preview_build_%d+_%d+_%d+_%d+%..+$') ~= nil
+end
+
+-- On startup the previous instance is no longer running. Sweep only our
+-- precisely named intermediates, including unknown ffmpeg/yt-dlp sidecars.
+-- In particular do NOT touch AUDIO_DIR, cache.json, or backup directories.
+do
+    gts20_preview_scan_files(gts20_preview_scratch_dir, function(name)
+        return gts20_preview_is_orphan_name(name, false)
+    end)
+    gts20_preview_scan_files(DATA_DIR, function(name)
+        return gts20_preview_is_orphan_name(name, true)
+    end)
+end
+
+local function gts20_preview_cleanup_job(job_name, base)
+    local prefix = job_name .. '.'
+    -- Enumeration covers ffmpeg temporary names (.temp.*, .part, .info.json,
+    -- and formats not known at development time).
+    gts20_preview_scan_files(gts20_preview_scratch_dir, function(name)
+        return name:sub(1, #prefix) == prefix
+    end)
+    -- Fallback when listing is unavailable: remove common output formats.
+    for _, ext in ipairs({'m4a', 'webm', 'mp3', 'ogg', 'opus', 'mp4', 'mkv',
+        'wav', 'flac', 'part', 'ytdl', 'info.json', 'mp3.part', 'm4a.part',
+        'webm.part', 'temp.mp3', 'temp.m4a'}) do
+        pcall(fs.remove, base .. '.' .. ext)
+    end
+end
+
+local function gts20_preview_download(key, video_id)
+    local exe = gts20_exe()
+    if not exe then return nil, 'yt_dlp_missing' end
+    ensure_data_dir()
+    local ok_dir = pcall(fs.create_directories, gts20_preview_scratch_dir)
+    if not ok_dir or not fs.exists(gts20_preview_scratch_dir) then
+        return nil, 'preview_temp_dir_unavailable'
+    end
+    -- Seconds-resolution names collided on rapid retries; a per-process
+    -- sequence and randomized suffix keep attempts distinct across restarts.
+    gts20_preview_job_sequence = gts20_preview_job_sequence + 1
+    local job_name = 'gts20_preview_build_' .. key .. '_' .. tostring(os.time())
+        .. '_' .. tostring(gts20_preview_job_sequence)
+        .. '_' .. tostring(math.floor(os.clock() * 1000000))
+        .. tostring(math.random(100000, 999999))
+    local base = join(gts20_preview_scratch_dir, job_name)
+    if not gts20_safe_path(base) then return nil, 'unsupported_install_path' end
+    local ffmpeg_in_data = join(DATA_DIR, 'ffmpeg.exe')
+    local ffmpeg_flag = ''
+    if fs.exists(ffmpeg_in_data) then
+        if not gts20_safe_path(ffmpeg_in_data) then return nil, 'unsupported_install_path' end
+        ffmpeg_flag = ' --ffmpeg-location "' .. ffmpeg_in_data .. '"'
+    end
+    -- yt-dlp delegates section downloads and mp3 transcoding to ffmpeg.
+    -- The *0-15 range is deliberately applied BEFORE audio extraction.
+    local cmd = exe .. ' --quiet --no-warnings --no-playlist --no-progress --no-part --no-mtime'
+       .. ' --socket-timeout 20 --retries 2 --fragment-retries 2'
+       .. ' --download-sections "*0-15" -f "bestaudio[ext=m4a]/bestaudio"'
+       .. ' --extract-audio --audio-format mp3 --audio-quality 5'
+       .. ffmpeg_flag .. ' -o "' .. base .. '.%(ext)s"'
+       .. ' "https://www.youtube.com/watch?v=' .. video_id .. '"'
+    -- Catch errors thrown by exec, so even that failure path gets cleanup.
+    local ran, _, status = pcall(utils.exec, cmd)
+    local output = base .. '.mp3'
+    if not ran or status ~= 0 or not fs.exists(output) then
+        gts20_preview_cleanup_job(job_name, base)
+        local ffmpeg_ran, _, ffmpeg_status = pcall(utils.exec, 'ffmpeg -version')
+        if (not ffmpeg_ran or ffmpeg_status ~= 0) and not fs.exists(ffmpeg_in_data) then
+            return nil, 'ffmpeg_missing_or_not_on_path'
+        end
+        return nil, 'preview_download_failed'
+    end
+    local file = io.open(output, 'rb')
+    if not file then
+        gts20_preview_cleanup_job(job_name, base)
+        return nil, 'preview_unreadable'
+    end
+    local size = file:seek('end') or 0
+    file:seek('set', 0)
+    -- Approximately 15 seconds of MP3 should be much less than 2 MiB.
+    local bytes = (size > 1024 and size <= 2 * 1024 * 1024) and file:read('*a') or nil
+    file:close()
+    gts20_preview_cleanup_job(job_name, base)
+    if not bytes then return nil, 'preview_invalid_audio_size' end
+    pcall(fs.create_directories, AUDIO_DIR)
+    local filename = gts20_preview_filename(key, video_id)
+    local target = join(AUDIO_DIR, filename)
+    local order = gts20_preview_order[key] or {}
+    if #order >= gts20_preview_limit then
+        local cleared, why = gts20_preview_clear_file(key, order[1])
+        if not cleared then return nil, why end
+    end
+    if not write_file(target, bytes) then
+        gts20_preview_remove(target)
+        return nil, 'preview_write_failed'
+    end
+    if not looks_like_audio(target) then
+        pcall(fs.remove, target)
+        return nil, 'preview_invalid_audio_file'
+    end
+    gts20_preview_touch(key, video_id)
+    gts20_preview_dirty[filename] = true
+    if not gts20_preview_registry_save() then
+        -- Never serve an untracked clip: if it cannot be removed right now,
+        -- startup's exact-filename sweep can still recover it.
+        gts20_preview_clear_file(key, video_id)
+        return nil, 'preview_registry_write_failed'
+    end
+    -- The same Steam loopback host used by normal theme playback.
+    return LOOPBACK_BASE .. filename .. '?v=' .. tostring(os.time()), nil
+end
+
+-- Only one namespaced table escapes the private helper function. No additional
+-- main-chunk locals are introduced, and no new global helper functions exist.
+return {
+    valid_video = gts20_preview_valid_video,
+    filename = gts20_preview_filename,
+    touch = gts20_preview_touch,
+    clear_file = gts20_preview_clear_file,
+    clear_app = gts20_preview_clear_app,
+    download = gts20_preview_download,
+    busy = function() return gts20_preview_busy end,
+    set_busy = function(value) gts20_preview_busy = value end,
+}
+end)()
+
+---@ffi
+---Download only seconds 0-15 of an approved search candidate for local preview.
+---@param app_id number Steam app id
+---@param video_id string Candidate ID returned by youtube_v20_search
+---@return string JSON {ok, url, error}
+function youtube_v20_preview(app_id, video_id)
+    local key = gts20_valid_app(app_id)
+    if not key then return json.encode({ok=false, error='invalid_app_id'}) end
+    if ignored[key] then return json.encode({ok=false, error='ignored'}) end
+    if not GTS20_PREVIEW_CORE.valid_video(video_id) then
+        return json.encode({ok=false, error='invalid_video_id'})
+    end
+    gts20_prune_sessions()
+    local session = gts20_sessions[key]
+    if not session or os.time() - session.ts >= 900 then
+        return json.encode({ok=false, error='search_expired'})
+    end
+    local authorized = false
+    for _, item in ipairs(session.items) do
+        if item.id == video_id then authorized = true; break end
+    end
+    if not authorized then return json.encode({ok=false, error='not_in_search_results'}) end
+    gts20_touch_session(session)
+    if resolve_busy or io_busy or GTS20_PREVIEW_CORE.busy() then
+        return json.encode({ok=false, error='busy'})
+    end
+    local filename = GTS20_PREVIEW_CORE.filename(key, video_id)
+    if fs.exists(join(AUDIO_DIR, filename)) then
+        if looks_like_audio(join(AUDIO_DIR, filename)) then
+            GTS20_PREVIEW_CORE.touch(key, video_id)
+            return json.encode({ok=true, url=LOOPBACK_BASE .. filename
+                .. '?v=' .. tostring(os.time()), seconds=15, cached=true})
+        end
+        local cleared, why = GTS20_PREVIEW_CORE.clear_file(key, video_id)
+        if not cleared then return json.encode({ok=false, error=why}) end
+    end
+    GTS20_PREVIEW_CORE.set_busy(true)
+    local ok, url, err = pcall(GTS20_PREVIEW_CORE.download, key, video_id)
+    GTS20_PREVIEW_CORE.set_busy(false)
+    if not ok then
+        logger:warn('v20.3 preview generation failed: ' .. tostring(url))
+        return json.encode({ok=false, error='internal_preview_error'})
+    end
+    if not url then return json.encode({ok=false, error=err or 'preview_failed'}) end
+    return json.encode({ok=true, url=url, seconds=15})
+end
+
+---@ffi
+---Remove the temporary clip for a specific selected preview, if still current.
+---@param app_id number Steam app id
+---@param video_id string Previously selected candidate ID
+---@return string JSON {ok}
+function youtube_v20_preview_clear(app_id, video_id)
+    local key = gts20_valid_app(app_id)
+    if not key then return json.encode({ok=false, error='invalid_app_id'}) end
+    if not GTS20_PREVIEW_CORE.valid_video(video_id) then
+        return json.encode({ok=false, error='invalid_video_id'})
+    end
+    if GTS20_PREVIEW_CORE.busy() then return json.encode({ok=false, error='busy'}) end
+    local cleared, clear_err = GTS20_PREVIEW_CORE.clear_file(key, video_id)
+    if not cleared then return json.encode({ok=false, error=clear_err}) end
+    return json.encode({ok=true})
+end
+
+---@ffi
+---Remove every temporary 15-second clip for this game when selection ends.
+---@param app_id number Steam app id
+---@return string JSON {ok, error}
+function youtube_v20_preview_clear_session(app_id)
+    local key = gts20_valid_app(app_id)
+    if not key then return json.encode({ok=false, error='invalid_app_id'}) end
+    if GTS20_PREVIEW_CORE.busy() then return json.encode({ok=false, error='busy'}) end
+    local cleared, clear_err = GTS20_PREVIEW_CORE.clear_app(key)
+    if not cleared then return json.encode({ok=false, error=clear_err}) end
+    return json.encode({ok=true})
+end
 ---@ffi
 ---Resolve the theme song for a game, downloading it if needed.
 ---@param app_id number Steam app id
@@ -1513,6 +2637,132 @@ local function store_custom(app_id, game_name, filename, title, data, ext_hint, 
     return json.encode({ ok = true, url = url })
 end
 
+-- Windows-only custom YouTube audio assignment. yt-dlp must be installed locally.
+-- Downloads a single permitted video and registers it via the same custom mapping
+-- used by local-file uploads. Do not accept raw shell arguments from the UI.
+local function gts_video_id(url)
+    if type(url) ~= 'string' or #url > 1024 then return nil end
+    url = url:match('^%s*(.-)%s*$')
+    local host, rest = url:match('^https?://([^/]+)(/.*)$')
+    if not host or not rest then return nil end
+    host = host:lower()
+    local id
+    if host == 'youtu.be' or host == 'www.youtu.be' then
+        id = rest:match('^/([A-Za-z0-9_-]+)')
+    elseif host == 'youtube.com' or host == 'www.youtube.com' or host == 'm.youtube.com'
+        or host == 'music.youtube.com' then
+        id = rest:match('^/watch%?.-[?&]v=([A-Za-z0-9_-]+)')
+            or rest:match('^/watch%?v=([A-Za-z0-9_-]+)')
+            or rest:match('^/shorts/([A-Za-z0-9_-]+)')
+            or rest:match('^/live/([A-Za-z0-9_-]+)')
+    end
+    if id and #id == 11 then return id end
+    return nil
+end
+
+---@ffi
+---Download authorized audio from one YouTube video with locally installed yt-dlp.
+---@param app_id number Steam app id
+---@param game_name string Game name
+---@param video_url string Youtube URL
+---@return string JSON { ok, title, error }
+function set_youtube_custom_music(app_id, game_name, video_url)
+    if SEP ~= '\\' then return json.encode({ok=false, error='windows_only'}) end
+    if not fs or not utils or type(utils.exec) ~= 'function' then
+        return json.encode({ok=false, error='exec_unsupported'})
+    end
+    local key = tostring(app_id or '')
+    if not key:match('^%d+$') or #key > 12 or tonumber(key) == 0 then
+        return json.encode({ok=false, error='invalid_app_id'})
+    end
+    local id = gts_video_id(video_url)
+    if not id then return json.encode({ok=false, error='invalid_youtube_url'}) end
+    local function result(ok, error, title)
+        return json.encode({ok=ok, error=error, title=title})
+    end
+    local ok, res = pcall(function()
+        ensure_data_dir()
+        -- Prefer a user-provided executable in the persistent data directory,
+        -- otherwise resolve yt-dlp from the Windows PATH.
+        local executable = 'yt-dlp'
+        local local_exe = join(DATA_DIR, 'yt-dlp.exe')
+        if fs.exists(local_exe) then executable = '"' .. local_exe .. '"' end
+        local check, status = utils.exec(executable .. ' --version')
+        if status ~= 0 then return result(false, 'yt_dlp_missing') end
+
+        local nonce = tostring(os.time()) .. '_' .. tostring(math.random(100000,999999))
+        local stem = join(DATA_DIR, 'gts_youtube_' .. key .. '_' .. nonce)
+        -- Steam and Millennium installation paths are local, but Windows cmd.exe
+        -- would interpret these characters even inside double quotes.
+        if stem:find('["%%!\r\n]') then return result(false, 'unsupported_install_path') end
+        local template = stem .. '.%(ext)s'
+        local canonical = 'https://www.youtube.com/watch?v=' .. id
+        local cmd = executable
+          .. ' --quiet --no-warnings --no-playlist --no-progress --no-part'
+          .. ' --no-mtime --socket-timeout 20 --retries 2 --fragment-retries 2'
+          .. ' --max-filesize 45M --write-info-json'
+          .. ' -f "bestaudio[ext=m4a]/bestaudio"'
+          .. ' -o "' .. template .. '" "' .. canonical .. '"'
+        local _, download_status = utils.exec(cmd)
+        local source, ext
+        for _, candidate in ipairs({'m4a', 'webm', 'opus', 'ogg', 'mp3', 'aac', 'flac', 'wav'}) do
+            local file = stem .. '.' .. candidate
+            if fs.exists(file) then source, ext = file, candidate; break end
+        end
+        local metadata_file = stem .. '.info.json'
+        if download_status ~= 0 or not source then
+            if source then pcall(fs.remove, source) end
+            pcall(fs.remove, metadata_file)
+            return result(false, 'download_failed')
+        end
+        local metadata = safe_decode(read_file(metadata_file) or '')
+        pcall(fs.remove, metadata_file)
+        local file = io.open(source, 'rb')
+        if not file then pcall(fs.remove, source); return result(false, 'read_failed') end
+        local size = file:seek('end') or 0
+        file:close()
+        if size < 1024 or size > 50 * 1024 * 1024 then
+            pcall(fs.remove, source)
+            return result(false, 'file_size_invalid')
+        end
+        pcall(fs.create_directories, AUDIO_DIR)
+        local normalized_ext = CUSTOM_EXTS[ext]
+        if not normalized_ext then
+            pcall(fs.remove, source)
+            return result(false, 'unsupported_format')
+        end
+        local filename = 'custom_' .. key .. '.' .. normalized_ext
+        local destination = join(AUDIO_DIR, filename)
+        if not copy_file(source, destination) then
+            pcall(fs.remove, source)
+            return result(false, 'write_failed')
+        end
+        pcall(fs.remove, source)
+        for oldext in pairs(CUSTOM_EXTS) do
+            if oldext ~= normalized_ext then
+                pcall(fs.remove, join(AUDIO_DIR, 'custom_' .. key .. '.' .. oldext))
+                pcall(fs.remove, join(CUSTOM_BACKUP_DIR, 'custom_' .. key .. '.' .. oldext))
+            end
+        end
+        local title = sanitize_text(type(metadata) == 'table' and metadata.title or '', 100)
+        if title == '' or title:lower():find('error', 1, true) then title = 'YouTube ' .. id end
+        local name = sanitize_text(game_name or '', 200)
+        local stamp = os.time()
+        custom[key] = {file=filename, title=title, name=name, ts=stamp}
+        save_custom()
+        custom_list_cache = nil
+        -- Unlike the upstream backup sync, overwrite old backups when replacing a song.
+        pcall(fs.create_directories, CUSTOM_BACKUP_DIR)
+        copy_file(destination, join(CUSTOM_BACKUP_DIR, filename))
+        sync_custom_backup()
+        return result(true, nil, title)
+    end)
+    if not ok then
+        logger:warn('set_youtube_custom_music failed: ' .. tostring(res))
+        return result(false, 'internal_error')
+    end
+    return res
+end
 ---@ffi
 ---Start a chunked custom music upload for a game.
 ---@param app_id number Steam app id
@@ -1588,6 +2838,93 @@ end
 local FALLBACK_FILE = "fallback.mp3"
 
 ---@ffi
+---Download one authorized YouTube audio track and make it the default fallback.
+---@param video_url string
+---@return string JSON { ok, error, title, file }
+function set_youtube_fallback_music(video_url)
+    local function result(ok, error, title, filename)
+        return json.encode({ok=ok, error=error, title=title, file=filename})
+    end
+    if SEP ~= "\\" then return result(false, 'windows_only') end
+    if not fs or not utils or type(utils.exec) ~= 'function' then return result(false, 'exec_unsupported') end
+    local id = gts_video_id(video_url)
+    if not id then return result(false, 'invalid_youtube_url') end
+    local ok, res = pcall(function()
+        ensure_data_dir()
+        local executable = 'yt-dlp'
+        local local_exe = join(DATA_DIR, 'yt-dlp.exe')
+        if fs.exists(local_exe) then executable = '"' .. local_exe .. '"' end
+        local _, check_status = utils.exec(executable .. ' --version')
+        if check_status ~= 0 then return result(false, 'yt_dlp_missing') end
+        local nonce = tostring(os.time()) .. '_' .. tostring(math.random(100000,999999))
+        local stem = join(DATA_DIR, 'gts_youtube_fallback_' .. nonce)
+        if stem:find('["%%!\r\n]') then return result(false, 'unsupported_install_path') end
+        local cmd = executable
+            .. ' --quiet --no-warnings --no-playlist --no-progress --no-part'
+            .. ' --no-mtime --socket-timeout 20 --retries 2 --fragment-retries 2'
+            .. ' --max-filesize 45M --write-info-json'
+            .. ' -f "bestaudio[ext=m4a]/bestaudio"'
+            .. ' -o "' .. stem .. '.%(ext)s"'
+            .. ' "https://www.youtube.com/watch?v=' .. id .. '"'
+        local _, status = utils.exec(cmd)
+        local source, ext
+        for _, candidate in ipairs({'m4a', 'webm', 'opus', 'ogg', 'mp3', 'aac', 'flac', 'wav'}) do
+            local candidate_path = stem .. '.' .. candidate
+            if fs.exists(candidate_path) then source, ext = candidate_path, candidate; break end
+        end
+        local metadata_file = stem .. '.info.json'
+        local meta = safe_decode(read_file(metadata_file) or '')
+        pcall(fs.remove, metadata_file)
+        if status ~= 0 or not source then
+            if source then pcall(fs.remove, source) end
+            return result(false, 'download_failed')
+        end
+        local file = io.open(source, 'rb')
+        if not file then pcall(fs.remove, source); return result(false, 'read_failed') end
+        local size = file:seek('end') or 0
+        file:close()
+        if size < 1024 or size > 50 * 1024 * 1024 then
+            pcall(fs.remove, source)
+            return result(false, 'file_size_invalid')
+        end
+        local normalized_ext = CUSTOM_EXTS[ext]
+        if not normalized_ext then
+            pcall(fs.remove, source)
+            return result(false, 'unsupported_format')
+        end
+        local filename = 'fallback.' .. normalized_ext
+        pcall(fs.create_directories, AUDIO_DIR)
+        if not copy_file(source, join(AUDIO_DIR, filename)) then
+            pcall(fs.remove, source)
+            return result(false, 'write_failed')
+        end
+        pcall(fs.remove, source)
+        pcall(fs.create_directories, CUSTOM_BACKUP_DIR)
+        copy_file(join(AUDIO_DIR, filename), join(CUSTOM_BACKUP_DIR, filename))
+        -- Remove stale fallback formats only AFTER the new track was saved.
+        for oldext in pairs(CUSTOM_EXTS) do
+            if oldext ~= normalized_ext then
+                pcall(fs.remove, join(AUDIO_DIR, 'fallback.' .. oldext))
+                pcall(fs.remove, join(CUSTOM_BACKUP_DIR, 'fallback.' .. oldext))
+            end
+        end
+        local title = sanitize_text(type(meta) == 'table' and meta.title or '', 100)
+        if title == '' then title = 'YouTube ' .. id end
+        settings.fallback_file = filename
+        settings.fallback_title = title
+        settings.fallback_ts = os.time()
+        save_settings()
+        sync_custom_backup()
+        return result(true, nil, title, filename)
+    end)
+    if not ok then
+        logger:warn('set_youtube_fallback_music failed: ' .. tostring(res))
+        return result(false, 'internal_error')
+    end
+    return res
+end
+
+---@ffi
 ---Start a chunked default-song upload.
 ---@return string JSON { ok }
 function set_fallback_begin()
@@ -1626,6 +2963,12 @@ function set_fallback_finish(title_b64)
         if not write_file(join(AUDIO_DIR, FALLBACK_FILE), bytes) then return json.encode({ ok = false, error = "write_failed" }) end
         pcall(fs.create_directories, CUSTOM_BACKUP_DIR)
         copy_file(join(AUDIO_DIR, FALLBACK_FILE), join(CUSTOM_BACKUP_DIR, FALLBACK_FILE))
+        for ext in pairs(CUSTOM_EXTS) do
+            if ext ~= 'mp3' then
+                pcall(fs.remove, join(AUDIO_DIR, 'fallback.' .. ext))
+                pcall(fs.remove, join(CUSTOM_BACKUP_DIR, 'fallback.' .. ext))
+            end
+        end
         local title = sanitize_text(base64_decode(tostring(title_b64 or "")))
         if title == "" then title = "Default song" end
         settings.fallback_file = FALLBACK_FILE
@@ -1646,8 +2989,10 @@ end
 function clear_fallback_music()
     local ok, result = pcall(function()
         if fs and fs.remove then
-            pcall(fs.remove, join(AUDIO_DIR, FALLBACK_FILE))
-            pcall(fs.remove, join(CUSTOM_BACKUP_DIR, FALLBACK_FILE))
+            for ext in pairs(CUSTOM_EXTS) do
+                pcall(fs.remove, join(AUDIO_DIR, 'fallback.' .. ext))
+                pcall(fs.remove, join(CUSTOM_BACKUP_DIR, 'fallback.' .. ext))
+            end
         end
         settings.fallback_file = ""
         settings.fallback_title = ""
@@ -1783,6 +3128,11 @@ end
 function get_settings()
     local fresh = safe_decode(read_file(CONFIG_FILE))
     if type(fresh) == "table" then settings = merge_defaults(fresh, DEFAULT_SETTINGS) end
+    if settings.manual_search ~= false or settings.confirm_before_download ~= false then
+        settings.manual_search = false
+        settings.confirm_before_download = false
+        save_settings()
+    end
     return json.encode(settings)
 end
 
@@ -1793,6 +3143,27 @@ end
 ---@return string JSON { ok }
 function set_setting(key, value)
     if DEFAULT_SETTINGS[key] == nil then return json.encode({ ok = false, error = "unknown_key" }) end
+    -- Never allow retired UI modes to be re-enabled by stale clients.
+    if key == 'manual_search' or key == 'confirm_before_download' then value = false end
+    if key == 'volume_overrides' then
+        -- JSON string passed via the existing primitive FFI settings bridge.
+        if type(value) ~= 'string' or #value > 65536 then
+            return json.encode({ ok = false, error = 'invalid_volume_map' })
+        end
+        local decoded = safe_decode(value)
+        if type(decoded) ~= 'table' then return json.encode({ ok = false, error = 'invalid_volume_map' }) end
+        local cleaned, count = {}, 0
+        for appid, volume in pairs(decoded) do
+            if type(appid) ~= 'string' or not appid:match('^[1-9]%d*$') or #appid > 12 or
+                type(volume) ~= 'number' or volume ~= volume or volume < 0 or volume > 1 then
+                return json.encode({ ok = false, error = 'invalid_volume_entry' })
+            end
+            count = count + 1
+            if count > 500 then return json.encode({ ok = false, error = 'too_many_overrides' }) end
+            cleaned[appid] = volume
+        end
+        value = cleaned
+    end
     settings[key] = value
     if not write_file_atomic(CONFIG_FILE, json.encode(settings)) then return json.encode({ ok = false, error = "write_failed" }) end
     return json.encode({ ok = true })
@@ -1852,6 +3223,20 @@ function clear_audio_cache()
     pcall(fs.remove, join(AUDIO_DIR, tostring(key) .. "_b." .. e))
 end
         end
+        -- Clear persisted automatic audio as well; never retain data the
+        -- user explicitly deleted. This folder only contains auto tracks.
+        local backups = fs and fs.list and fs.list(AUTO_TRACK_DIR) or nil
+        if type(backups) == 'table' then
+            for _, item in ipairs(backups) do
+                if item.is_file then
+                    local base = tostring(item.name or '')
+                    -- Includes recovery artifacts (.previous/.incoming).
+                    if base:match('^%d+_?b?%.[%w]+') then
+                        pcall(fs.remove, join(AUTO_TRACK_DIR, base))
+                    end
+                end
+            end
+        end
         cache = {}
         mem_cache.soundtrack = {}
         mem_cache.khinsider = {}
@@ -1861,6 +3246,60 @@ end
     end)
     if not ok then logger:warn("clear_audio_cache crashed: " .. tostring(result)); return json.encode({ ok = false, error = "internal_error" }) end
     return result
+end
+
+---@ffi
+---Remove all managed theme tracks: cached downloads plus individual
+---custom files (both live and backup copies) across every game.
+---Does NOT remove the user's default fallback song or saved settings.
+---@return string JSON { ok, removed_downloaded, removed_custom }
+function clear_all_managed_theme_songs()
+    local ok, result = pcall(function()
+        local ids = {}
+        for key in pairs(custom) do ids[#ids + 1] = key end
+        local custom_removed, custom_failed = 0, 0
+        for _, key in ipairs(ids) do
+            local response = safe_decode(clear_custom_music(key))
+            if type(response) == 'table' and response.ok then
+                custom_removed = custom_removed + 1
+            else
+                custom_failed = custom_failed + 1
+            end
+        end
+        -- Attempt cached-track deletion even if individual custom removals fail.
+        local cache_response = safe_decode(clear_audio_cache())
+        local cache_ok = type(cache_response) == 'table' and cache_response.ok
+        if custom_failed > 0 or not cache_ok then
+            return json.encode({ ok = false, error = 'partial_clear', removed_custom = custom_removed,
+                failed_custom = custom_failed, removed_downloaded = cache_ok and cache_response.removed or 0 })
+        end
+        return json.encode({ ok = true, removed_custom = custom_removed,
+            removed_downloaded = cache_response.removed or 0 })
+    end)
+    if not ok then
+        logger:warn('clear_all_managed_theme_songs crashed: ' .. tostring(result))
+        return json.encode({ ok = false, error = 'internal_error' })
+    end
+    return result
+end
+
+---@ffi
+---Return count and total bytes of active, per-game custom audio files.
+---Does not count backup copies or the global default fallback song.
+---@return string JSON { ok, count, bytes }
+function get_custom_storage_info()
+    return run_io("get_custom_storage_info", function()
+        local sizes = audio_dir_sizes()
+        local count, bytes = 0, 0
+        for _, entry in pairs(custom) do
+            if type(entry) == 'table' and type(entry.file) == 'string'
+                and sizes[entry.file] then
+                count = count + 1
+                bytes = bytes + sizes[entry.file]
+            end
+        end
+        return json.encode({ ok = true, count = count, bytes = bytes })
+    end)
 end
 
 ---@ffi
@@ -1899,6 +3338,10 @@ function clear_cache_for(app_id)
     pcall(fs.remove, join(AUDIO_DIR, key .. "." .. e))
     pcall(fs.remove, join(AUDIO_DIR, key .. "_b." .. e))
 end
+        for _, ext in ipairs(AUDIO_EXTS) do
+            gts_auto_forget_audio(key, key .. '.' .. ext)
+            gts_auto_forget_audio(key, key .. '_b.' .. ext)
+        end
         cache[key] = nil
         save_cache()
         return json.encode({ ok = true, bytes = freed })
@@ -1922,23 +3365,25 @@ local function on_load()
     pcall(migrate_all_data)
     local prev_boot = tonumber(read_file(BOOT_MARKER) or "") or 0
     if prev_boot >= 1 then
-        pcall(os.remove, CACHE_FILE)
+        -- A half-finished boot is NOT evidence that saved tracks are invalid.
+        -- Preserve downloaded music and its index across updates/crashes.
         pcall(os.remove, RESOLVE_MARKER)
         if prev_boot >= 2 then
             local cdata = read_file(CUSTOM_FILE)
             if cdata and cdata ~= "" then write_file(CUSTOM_FILE .. ".bak", cdata) end
         end
-        pcall(function() logger:warn("previous boot did not finish (attempt " .. prev_boot .. "); reset cache") end)
+        pcall(function() logger:warn("previous boot did not finish (attempt " .. prev_boot .. "); preserving downloaded music") end)
     end
     write_file(BOOT_MARKER, tostring(prev_boot + 1))
+    gts_auto_restore_index()
     load_state()
+    gts_auto_reconcile_tracks()
     restore_custom_backup()
     local prev = read_file(RESOLVE_MARKER)
     if prev and prev ~= "" then
-        cache[prev] = nil
-        save_cache()
+        -- Preserve valid saved entries after an interrupted resolution.
         pcall(os.remove, RESOLVE_MARKER)
-        pcall(function() logger:warn("cleared cache after previous crash for app " .. prev) end)
+        pcall(function() logger:warn("stale resolve marker cleared; kept cached theme for app " .. prev) end)
     end
     pcall(os.remove, BOOT_MARKER)
     millennium.ready()

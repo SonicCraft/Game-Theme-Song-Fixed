@@ -13,6 +13,7 @@ export interface ContextState {
 export interface Settings {
   enabled: boolean;
   volume: number;
+  volume_overrides?: Record<string, number>;
   fade_seconds: number;
   search_suffix: string;
   loop: boolean;

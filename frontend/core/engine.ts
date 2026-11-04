@@ -1,11 +1,12 @@
 import type { Settings, CacheInfo, ContextState, PlaybackMode } from './types';
-import { getThemeAudio, rerollTheme, invalidateAudio, getBackendSettings, getCacheInfo, getIgnoredList, setIgnoredBackend } from './api';
+import { getThemeAudio, rerollTheme, invalidateAudio, getBackendSettings, getCacheInfo, getIgnoredList, setIgnoredBackend, setBackendSetting } from './api';
 import { warn } from './log';
 import { setLocalizationEnabled } from './i18n';
 
 const DEFAULTS: Settings = {
   enabled: true,
   volume: 0.35,
+  volume_overrides: {},
   fade_seconds: 1.5,
   search_suffix: ' theme song',
   loop: true,
@@ -30,6 +31,61 @@ export function getCurrentAppId(): number | null {
   return currentAppId;
 }
 
+// v21.4: Per-game volume levels use Steam AppIDs, not track names or files.
+// Null means follow the global volume; zero is a valid muted override.
+export function getGameVolumeOverride(appId: number | null): number | null {
+  if (appId == null || !Number.isSafeInteger(appId) || appId <= 0) return null;
+  const value = state.settings.volume_overrides?.[String(appId)];
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 1 ? value : null;
+}
+export function getEffectiveThemeVolume(appId: number | null = currentAppId): number {
+  const selected = getGameVolumeOverride(appId) ?? state.settings.volume;
+  return Number.isFinite(selected) ? Math.max(0, Math.min(1, selected)) : 0.35;
+}
+export function applyCurrentThemeVolume(): void {
+  if (audioEl && !audioEl.paused && !pausedByBlur) {
+    clearFade(); // A user-initiated change supersedes an in-progress fade-in.
+    audioEl.volume = getEffectiveThemeVolume();
+  }
+}
+let gameVolumeSaveTimer: ReturnType<typeof setTimeout> | null = null;
+let gameVolumeSaveChain: Promise<void> = Promise.resolve();
+let gameVolumeSaveDirty = false;
+// A best-effort flush removes the 200 ms wait on popup/Steam shutdown.
+// No asynchronous RPC is guaranteed to finish if the Steam webview is killed.
+export function flushGameVolumeOverrideSave(): Promise<void> {
+  if (gameVolumeSaveTimer) { clearTimeout(gameVolumeSaveTimer); gameVolumeSaveTimer = null; }
+  if (!gameVolumeSaveDirty) return gameVolumeSaveChain;
+  gameVolumeSaveDirty = false;
+  const snapshot = JSON.stringify(state.settings.volume_overrides ?? {});
+  gameVolumeSaveChain = gameVolumeSaveChain.catch(() => {}).then(async () => {
+    const raw = await setBackendSetting('volume_overrides', snapshot);
+    const response = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    if (!response?.ok) throw Error(String(response?.error ?? 'unknown_error'));
+  }).catch(error => {
+    gameVolumeSaveDirty = true; // Allow next lifecycle/slider event to retry.
+    warn('save per-game theme volume failed', error);
+  });
+  return gameVolumeSaveChain;
+}
+if (typeof window !== 'undefined') {
+  window.addEventListener('pagehide', () => { void flushGameVolumeOverrideSave(); });
+  window.addEventListener('beforeunload', () => { void flushGameVolumeOverrideSave(); });
+}
+export function setGameVolumeOverride(appId: number, value: number | null): void {
+  if (!Number.isSafeInteger(appId) || appId <= 0) return;
+  if (value !== null && (!Number.isFinite(value) || value < 0 || value > 1)) return;
+  const next = { ...(state.settings.volume_overrides ?? {}) };
+  if (value === null) delete next[String(appId)];
+  else next[String(appId)] = Math.round(value * 100) / 100;
+  state.settings.volume_overrides = next;
+  if (currentAppId === appId) applyCurrentThemeVolume();
+  gameVolumeSaveDirty = true;
+  if (gameVolumeSaveTimer) clearTimeout(gameVolumeSaveTimer);
+  // Normal slider drags still coalesce. Popup/window exit flushes immediately.
+  gameVolumeSaveTimer = setTimeout(() => { void flushGameVolumeOverrideSave(); }, 200);
+}
+
 export async function loadSettingsOnce() {
   try {
     const raw = await getBackendSettings();
@@ -37,7 +93,7 @@ export async function loadSettingsOnce() {
     if (s && typeof s === 'object') {
       state.settings = { ...state.settings, ...s };
       setLocalizationEnabled(state.settings.localized !== false);
-      if (audioEl) audioEl.volume = state.settings.volume;
+      if (audioEl) audioEl.volume = getEffectiveThemeVolume();
     }
   } catch (e) {
     warn('failed to load settings on start', e);
@@ -145,7 +201,7 @@ async function playUrl(url: string, mySeq: number, active: () => number): Promis
     a.pause();
     return false;
   }
-  fadeTo(state.settings.volume, state.settings.fade_seconds);
+  fadeTo(getEffectiveThemeVolume(), state.settings.fade_seconds);
   return true;
 }
 
@@ -234,6 +290,10 @@ let currentGameName: string | null = null;
 let currentTitle: string | null = null;
 let currentUrl: string | null = null;
 let rerollExclude: string[] = [];
+export type YoutubeV20Candidate = { id: string; title: string; uploader: string; duration: number; score: number; qualified?: boolean };
+let youtubeV20Pending: { appId: number; items: YoutubeV20Candidate[] } | null = null;
+export function getYoutubeV20Pending(): { appId: number; items: YoutubeV20Candidate[] } | null { return youtubeV20Pending; }
+export function clearYoutubeV20Pending(): void { youtubeV20Pending = null; notifyContext(); }
 let pendingAppId: number | null
 
 async function resolveAndPlay(
@@ -271,6 +331,15 @@ async function resolveAndPlay(
   }
 }
   if (mySeq !== getSeq()) return { ok: false, title: null, url: null, cached: false, custom: false };
+  if (resp?.error === 'youtube_needs_confirmation' && Array.isArray(resp.candidates)) {
+    youtubeV20Pending = { appId, items: resp.candidates };
+    notifyContext();
+    // Do not silently download low-confidence audio. Prompt via the existing
+    // native Steam manager, without importing a hard dependency in this module.
+    void import('../settings/managerPopups').then(({ openManagerPopup }) => {
+      if (mySeq === getSeq() && currentAppId === appId) openManagerPopup('main');
+    }).catch(e => warn('v20 could not open match picker', e));
+  }
   if (!resp?.ok || !resp.url) {
     warn('no audio for', name, resp?.error);
     return { ok: false, title: null, url: null, cached: false, custom: false };
@@ -488,6 +557,9 @@ export async function setAppIgnored(appId: number, value: boolean): Promise<bool
 		if (value && currentAppId === appId) {
 			++activeSeq;
 			stopAudio(0.3);
+			currentTitle = null;
+			currentUrl = null;
+			pendingConfirmAppId = null;
 			setPlaybackMode('off');
 		}
 		if (!value && currentAppId === appId) void reapplyForApp(appId);
@@ -502,7 +574,21 @@ async function playForApp(appId: number) {
   let mySeq = -1;
   try {
     if (!state.settings.enabled) return;
-    if (ignoredSet.has(appId)) return;
+    if (ignoredSet.has(appId)) {
+      currentAppId = appId;
+      mySeq = ++activeSeq;
+      currentGameName = null;
+      currentTitle = null;
+      currentUrl = null;
+      pendingConfirmAppId = null;
+      setPlaybackMode('off');
+      const name = await resolveGameName(appId);
+      if (mySeq === activeSeq) {
+        currentGameName = name;
+        notifyContext();
+      }
+      return; // Avoid fetching, searching, playing, or falling back.
+    }
     if (shouldSuppressPlayback(appId)) return;
     if (currentAppId === appId && audioEl && !audioEl.paused) return;
     if (pendingAppId != null && pendingAppId !== appId) {
@@ -516,6 +602,7 @@ async function playForApp(appId: number) {
     currentTitle = null;
     currentUrl = null;
     rerollExclude = [];
+    youtubeV20Pending = null;
     notifyContext();
     const name = await resolveGameName(appId);
     if (mySeq !== activeSeq) return;
@@ -595,9 +682,12 @@ function pollOnce() {
   let id: number | null = null;
   try { id = detectAppId(); } catch { return; }
   if (bootObserveUntil !== 0 && Date.now() < bootObserveUntil) {
-    lastDetectedAppId = id;
+    // v21.2: observe startup without marking this app as processed.
+    // A first-game selection can occur before Steam finishes initializing.
     return;
   }
+  // Once Steam has settled, process the current route even when it never changed.
+  if (bootObserveUntil !== 0) bootObserveUntil = 0;
   if (id === lastDetectedAppId) return;
   lastDetectedAppId = id;
 
@@ -704,6 +794,16 @@ export function unregisterLaunchStop() {
 let focusTimer: ReturnType<typeof setInterval> | null = null;
 
 function isAnySteamWindowFocused(): boolean {
+  // Steam's music manager lives in its own document and may not be listed
+  // in SteamUIWindows. An OPEN but unfocused popup must not suppress pausing.
+  try {
+    const popups: any[] = (globalThis as any).g_PopupManager?.GetPopups?.() ?? [];
+    for (const popup of popups) {
+      const view: any = popup?.m_popup ?? popup?.window;
+      const doc: Document | undefined = view?.document ?? popup?.window?.document;
+      if (doc?.hasFocus?.()) return true;
+    }
+  } catch { /* Steam's popup manager is optional across clients */ }
 	try {
 		const wins: any = (globalThis as any).SteamUIStore?.WindowStore?.SteamUIWindows ?? [];
 		for (const w of wins) {
@@ -718,13 +818,11 @@ function isAnySteamWindowFocused(): boolean {
 }
 
 function checkFocusOnce() {
-	if (libWindowOpen || cacheWindowOpen || mainWindowOpen) return;
-	if (!state.settings.stop_on_launch && (runningApps.size > 0 || Date.now() < recentLaunchUntil)) return;
 	const a = audioEl;
 	if (!isAnySteamWindowFocused()) {
 		if (a && !a.paused && !pausedByBlur) {
 			pausedByBlur = true;
-			fadeTo(0, 0.3, () => {
+			fadeTo(0, state.settings.fade_seconds, () => {
 				if (pausedByBlur && audioEl) audioEl.pause();
 			});
 		}
@@ -733,10 +831,10 @@ function checkFocusOnce() {
 	if (a && currentAppId != null && !shouldSuppressPlayback(currentAppId)) {
 		if (a.paused) {
 			void a.play()
-				.then(() => fadeTo(state.settings.volume, 0.5))
+				.then(() => fadeTo(getEffectiveThemeVolume(), state.settings.fade_seconds))
 				.catch(() => {});
 		} else {
-			fadeTo(state.settings.volume, 0.5);
+			fadeTo(getEffectiveThemeVolume(), state.settings.fade_seconds);
 		}
 	}
 }

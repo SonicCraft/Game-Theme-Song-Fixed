@@ -1,3 +1,19 @@
+# Fork release history
+
+## [3.0.0] - 2026-11-04
+
+First public release of the SonicCraft-maintained fork, based on BambooFury's v2.2.0 source. Based on the internally tested v21.4.2 development build, with additional pre-release cleanup hardening.
+
+- YouTube-only theme discovery, custom search, and 15-second previews.
+- Isolated 15-second preview, search, and full-download scratch files with crash-recovery cleanup.
+- Unified theme management and custom track assignment.
+- Per-game volume overrides, startup detection, and desktop-only music-note control.
+- Persistent automatic-theme cache backup and startup recovery.
+
+---
+
+## Upstream history
+
 # Changelog
 
 ## [2.2.0](https://github.com/BambooFury/Game-Theme-Song/compare/v2.1.1...v2.2.0) (2026-10-03)

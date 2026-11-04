@@ -1,0 +1,9 @@
+export interface ClassModule {
+    [name: string]: string;
+}
+export declare const classMapList: ClassModule[];
+export declare const classMap: ClassModule;
+export declare function findClass(name: string): string | void;
+export declare const Classes: any;
+export declare function findClassModule(filter: (module: any) => boolean): ClassModule | void;
+export declare function unminifyClass(minifiedClass: string): string | void;
