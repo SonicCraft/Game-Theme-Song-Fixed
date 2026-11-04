@@ -1,19 +1,18 @@
 # Game Theme Song (Fixed)
 
-A community-maintained fork of [BambooFury/Game-Theme-Song](https://github.com/BambooFury/Game-Theme-Song), modified for Steam Millennium.
+A fork of [BambooFury/Game-Theme-Song](https://github.com/BambooFury/Game-Theme-Song), modified for use with Steam Millennium.
 
 **Current version: v3.0.0**. Based on original upstream v2.2.0.
 
 ## Features
 
-- Automatically discovers game themes using YouTube; prioritizes soundtrack matches, including main themes and main-menu tracks.
+- # Shows the game-theme manager button in desktop Steam only. Big Picture background playback remains available. - This is the reason I made this fork, the original's button didn't show up ever.
+- Automatically discovers game themes using YouTube; prioritizes soundtrack matches, including main themes and main-menu tracks. - I gutted the previous search logic in favor of YouTube for more accurate search results.
 - Lets you search YouTube manually, listen to 15-second local previews, then confirm the full download.
-- Isolates preview, search, and full-download intermediates; cleans them after failed operations or interrupted Steam sessions.
 - Assigns confirmed results as custom themes, alongside local files and pasted YouTube links.
-- Manages downloaded and custom themes together, including per-game deletion and a confirmed bulk-clear operation.
-- Supports global and per-game playback volume, looping, length limits, fades, and a default fallback theme.
-- Shows the music-note manager button in desktop Steam only. Big Picture background playback remains available without an injected button.
-- Protects automatically downloaded audio and its cache index using persistent copies outside Steam's UI directory.
+- Manages downloaded and custom themes together, including per-game deletion and a confirmed bulk-clear operation. - I merged the two previous menus that handled these.
+- Supports global and per-game playback volume, looping, length limits, fades, and a default fallback theme. - Added per game volume control and a more fine tuned audio fade slider.
+
 
 ## Requirements
 
@@ -36,14 +35,7 @@ The resulting `.star` should be in `dist/`. Install it as a Millennium plugin an
 
 ## Versioning
 
-The release version uses `MAJOR.MINOR.PATCH`; current version is `3.0.0`. This is the first public fork release, derived from the internally tested v21.4.2 baseline with pre-release cleanup hardening. To bump all metadata files, run:
-
-```powershell
-npm run version:set -- 3.0.1
-npm run version:check
-```
-
-Use a matching GitHub release tag (starting with `v3.0.0`). The original upstream v2.2.0 and internal development v21.4.2 are historical references, not public release versions.
+The release version uses `MAJOR.MINOR.PATCH`; current version is `3.0.0`. This is the first public fork release.
 
 ## Credits and license
 
