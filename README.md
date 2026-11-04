@@ -2,11 +2,13 @@
 
 A fork of [BambooFury/Game-Theme-Song](https://github.com/BambooFury/Game-Theme-Song), modified for use with Steam Millennium.
 
+_**Disclaimer: I don't know how to make a plugin for millennium. I just had a free trial with ChatGPT and some time to burn. What I know is that it works. If you don't like AI, oh well.**_
+
 **Current version: v3.0.0**. Based on original upstream v2.2.0.
 
 ## Features
 
-- # Shows the game-theme manager button in desktop Steam only. Big Picture background playback remains available. - This is the reason I made this fork, the original's button didn't show up ever.
+- Shows the game-theme manager button in desktop Steam only. Big Picture background playback remains available. - This is the reason I made this fork, the original's button didn't show up ever.
 - Automatically discovers game themes using YouTube; prioritizes soundtrack matches, including main themes and main-menu tracks. - I gutted the previous search logic in favor of YouTube for more accurate search results.
 - Lets you search YouTube manually, listen to 15-second local previews, then confirm the full download.
 - Assigns confirmed results as custom themes, alongside local files and pasted YouTube links.
